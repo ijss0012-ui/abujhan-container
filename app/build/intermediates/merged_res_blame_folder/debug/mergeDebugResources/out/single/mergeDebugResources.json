@@ -1,0 +1,30 @@
+[
+    {
+        "merged": "com.abujhan.container.app-debug-37:/layout_dialog_progress.xml.flat",
+        "source": "com.abujhan.container.app-main-39:/layout/dialog_progress.xml"
+    },
+    {
+        "merged": "C:\\Users\\Msi\\.gradle\\daemon\\9.6.0\\com.abujhan.container.app-debug-37:\\layout_activity_map_picker.xml.flat",
+        "source": "C:\\Users\\Msi\\.gradle\\daemon\\9.6.0\\com.abujhan.container.app-main-39:\\layout\\activity_map_picker.xml"
+    },
+    {
+        "merged": "C:\\Users\\Msi\\.gradle\\daemon\\9.6.0\\com.abujhan.container.app-debug-37:\\layout_item_app.xml.flat",
+        "source": "C:\\Users\\Msi\\.gradle\\daemon\\9.6.0\\com.abujhan.container.app-main-39:\\layout\\item_app.xml"
+    },
+    {
+        "merged": "C:\\Users\\Msi\\.gradle\\daemon\\9.6.0\\com.abujhan.container.app-debug-37:\\drawable_ic_launcher.xml.flat",
+        "source": "C:\\Users\\Msi\\.gradle\\daemon\\9.6.0\\com.abujhan.container.app-main-39:\\drawable\\ic_launcher.xml"
+    },
+    {
+        "merged": "C:\\Users\\Msi\\.gradle\\daemon\\9.6.0\\com.abujhan.container.app-debug-37:\\xml_file_paths.xml.flat",
+        "source": "C:\\Users\\Msi\\.gradle\\daemon\\9.6.0\\com.abujhan.container.app-main-39:\\xml\\file_paths.xml"
+    },
+    {
+        "merged": "C:\\Users\\Msi\\.gradle\\daemon\\9.6.0\\com.abujhan.container.app-debug-37:\\layout_item_container.xml.flat",
+        "source": "C:\\Users\\Msi\\.gradle\\daemon\\9.6.0\\com.abujhan.container.app-main-39:\\layout\\item_container.xml"
+    },
+    {
+        "merged": "C:\\Users\\Msi\\.gradle\\daemon\\9.6.0\\com.abujhan.container.app-debug-37:\\layout_activity_main.xml.flat",
+        "source": "C:\\Users\\Msi\\.gradle\\daemon\\9.6.0\\com.abujhan.container.app-main-39:\\layout\\activity_main.xml"
+    }
+]

@@ -1,0 +1,4447 @@
+﻿=== C:\Users\Msi\Desktop\flint\abujhan-container\app\src\main\java\com\abujhan\container\clone\axml\AxmlEditor.kt ===
+package com.abujhan.container.clone.axml
+
+import java.io.ByteArrayOutputStream
+
+/**
+ * محرّر مبسّط لملف AndroidManifest.xml الثنائي (AXML).
+ *
+ * لا يعتمد على أي مكتبة أندرويد خارجية، لذا يمكن اختباره على الـ JVM مباشرة.
+ *
+ * الوظائف المطلوبة للاستنساخ:
+ *  - تغيير اسم الحزمة (package).
+ *  - إعادة تسمية المكوّنات النسبية (‎.MainActivity‎) والصلاحيات المخصّصة ومزوّدي المحتوى (authorities).
+ *  - حذف sharedUserId.
+ *  - إضافة عنصر <provider> جديد داخل <application> لحقن كود الموقع الوهمي.
+ *
+ * الفكرة الأساسية: لا نعيد ترتيب جدول النصوص (String Pool) أبدًا، بل نضيف نصوصًا
+ * جديدة في النهاية. هذا يحافظ على صحّة كل الفهارس (بما فيها ResourceMap) دون تعديلها.
+ */
+class AxmlEditor(private val original: ByteArray) {
+
+    private val strings = ArrayList<String>()
+    private val chunks = ArrayList<Any>() // ByteArray (خام) أو Element
+    private var androidNs = -1
+
+    init {
+        parse()
+        androidNs = indexOfString(ANDROID_NS)
+    }
+
+    // ------------------------------------------------------------------ parse
+
+    private fun parse() {
+        require(original.size >= 8) { "AXML too small" }
+        require(u16(0) == TYPE_XML) { "Not a binary XML file" }
+
+        val poolSize = parseStringPool(8)
+
+        var offset = 8 + poolSize
+        while (offset + 8 <= original.size) {
+            val type = u16(offset)
+            val size = u32(offset + 4)
+            if (size <= 0 || offset + size > original.size) break
+            if (type == TYPE_START_ELEMENT) {
+                chunks.add(parseElement(offset))
+            } else {
+                chunks.add(original.copyOfRange(offset, offset + size))
+            }
+            offset += size
+        }
+    }
+
+    private fun parseStringPool(off: Int): Int {
+        val headerSize = u16(off + 2)
+        val size = u32(off + 4)
+        val count = u32(off + 8)
+        val flags = u32(off + 16)
+        val stringsStart = u32(off + 20)
+        val utf8 = (flags and UTF8_FLAG) != 0
+        val offsetsBase = off + headerSize
+
+        strings.clear()
+        for (i in 0 until count) {
+            val so = u32(offsetsBase + i * 4)
+            val p = off + stringsStart + so
+            strings.add(if (utf8) decodeUtf8(p) else decodeUtf16(p))
+        }
+        return size
+    }
+
+    private fun decodeUtf8(start: Int): String {
+        var p = start
+        var len = u8(p)
+        if (len and 0x80 != 0) {
+            len = ((len and 0x7F) shl 8) or u8(p + 1); p += 2
+        } else p += 1
+        var blen = u8(p)
+        if (blen and 0x80 != 0) {
+            blen = ((blen and 0x7F) shl 8) or u8(p + 1); p += 2
+        } else p += 1
+        return String(original, p, blen, Charsets.UTF_8)
+    }
+
+    private fun decodeUtf16(start: Int): String {
+        var p = start
+        var len = u16(p); p += 2
+        if (len and 0x8000 != 0) {
+            len = ((len and 0x7FFF) shl 16) or u16(p); p += 2
+        }
+        return String(original, p, len * 2, Charsets.UTF_16LE)
+    }
+
+    private fun parseElement(off: Int): Element {
+        val headerSize = u16(off + 2)
+        val base = off + headerSize
+        val ns = u32(base)
+        val name = u32(base + 4)
+        val attrStart = u16(base + 8)
+        val attrSize = u16(base + 10)
+        val attrCount = u16(base + 12)
+        // attrStart نسبةً إلى بنية attrExt (التي تبدأ عند off + headerSize)
+        val attrsBase = off + headerSize + attrStart
+
+        val attrs = ArrayList<Attr>(attrCount)
+        for (i in 0 until attrCount) {
+            val p = attrsBase + i * attrSize
+            attrs.add(
+                Attr(
+                    ns = u32(p),
+                    name = u32(p + 4),
+                    rawValue = u32(p + 8),
+                    valueType = u8(p + 15),
+                    valueData = u32(p + 16),
+                )
+            )
+        }
+        return Element(ns, name, attrs)
+    }
+
+    // --------------------------------------------------------------- helpers
+
+    private fun u8(p: Int): Int = original[p].toInt() and 0xFF
+    private fun u16(p: Int): Int = u8(p) or (u8(p + 1) shl 8)
+    private fun u32(p: Int): Int = u16(p) or (u16(p + 2) shl 16)
+
+    private fun indexOfString(s: String): Int = strings.indexOf(s)
+
+    private fun addString(s: String): Int {
+        val existing = strings.indexOf(s)
+        if (existing >= 0) return existing
+        strings.add(s)
+        return strings.size - 1
+    }
+
+    private fun elementName(e: Element): String =
+        if (e.name in strings.indices) strings[e.name] else ""
+
+    private fun attrName(a: Attr): String =
+        if (a.name in strings.indices) strings[a.name] else ""
+
+    private fun attrValue(a: Attr): String? = when {
+        a.valueType == TYPE_STRING && a.valueData in strings.indices -> strings[a.valueData]
+        a.rawValue in strings.indices -> strings[a.rawValue]
+        else -> null
+    }
+
+    private fun setAttrString(a: Attr, value: String) {
+        val index = addString(value)
+        a.valueType = TYPE_STRING
+        a.valueData = index
+        // مهم: محلّل أندرويد يقرأ القيمة الخام (raw) لسمات النصوص، لذا نضبطها أيضًا.
+        a.rawValue = index
+    }
+
+    // ------------------------------------------------------------ public API
+
+    /** أقل إصدار Android يدعمه التطبيق (من <uses-sdk>)، أو null إن لم يُذكر. */
+    fun minSdkVersion(): Int? {
+        val usesSdk = chunks.filterIsInstance<Element>().firstOrNull { elementName(it) == "uses-sdk" }
+            ?: return null
+        val value = usesSdk.attrs.firstOrNull { attrName(it) == "minSdkVersion" } ?: return null
+        return value.valueData
+    }
+
+    fun packageName(): String? {
+        val manifest = chunks.filterIsInstance<Element>().firstOrNull { elementName(it) == "manifest" }
+            ?: return null
+        return manifest.attrs.firstOrNull { attrName(it) == "package" }?.let { attrValue(it) }
+    }
+
+    /**
+     * يجهّز المانيفست لنسخة جديدة (الحزمة الأساسية فقط):
+     *  - إعادة تسمية الحزمة وكل ما يرتبط بها.
+     *  - extractNativeLibs=true.
+     *  - إضافة صلاحيات إضافية إن وُجدت (الافتراضي لا شيء).
+     *  - حقن ContentProvider لتشغيل وحدة الموقع الوهمي.
+     */
+    fun patchForClone(
+        oldPkg: String,
+        newPkg: String,
+        injectProviderClass: String,
+        providerAuthority: String,
+        extraPermissions: List<String> = emptyList(),
+    ) {
+        renamePackage(oldPkg, newPkg)
+        setExtractNativeLibs()
+        addUsesPermissions(extraPermissions)
+        addInjectProvider(injectProviderClass, providerAuthority)
+        addQueriesProvider(HOST_LOCATION_AUTHORITY)
+    }
+
+    /** يُصرّح للنسخة برؤية مزوّد ABUJHAN (رؤية الحزم في أندرويد 11+). */
+    private fun addQueriesProvider(authority: String) {
+        val manifestIndex = chunks.indexOfFirst { it is Element && elementName(it) == "manifest" }
+        if (manifestIndex < 0) return
+
+        val queriesIndex = addString("queries")
+        val providerIndex = addString("provider")
+        chunks.add(manifestIndex + 1, Element(-1, queriesIndex, arrayListOf()))
+        chunks.add(manifestIndex + 2, Element(-1, providerIndex, arrayListOf(stringAttr("authorities", authority))))
+        chunks.add(manifestIndex + 3, EndElement(-1, providerIndex))
+        chunks.add(manifestIndex + 4, EndElement(-1, queriesIndex))
+    }
+
+    /** يعيد تسمية الحزمة وكل ما يرتبط بها دون أي حقن (يُستخدم أيضًا لحِزم التقسيم). */
+    fun renamePackage(oldPkg: String, newPkg: String) {
+        chunks.filterIsInstance<Element>().firstOrNull { elementName(it) == "manifest" }
+            ?.attrs?.firstOrNull { attrName(it) == "package" }
+            ?.let { setAttrString(it, newPkg) }
+
+        for (chunk in chunks) {
+            if (chunk !is Element) continue
+            val name = elementName(chunk)
+            val isComponent = name in COMPONENT_TAGS
+            val isPermissionTag = name in PERMISSION_TAGS
+
+            val toRemove = ArrayList<Attr>()
+            for (a in chunk.attrs) {
+                val an = attrName(a)
+                when {
+                    an == "sharedUserId" -> toRemove.add(a)
+
+                    // اسم الحزمة يُعالَج أعلاه؛ نتجنّب تطبيق قاعدة البادئة عليه مرّتين.
+                    an == "package" && name == "manifest" -> Unit
+
+                    an == "name" && isComponent ->
+                        attrValue(a)?.let { setAttrString(a, resolveComponentName(it, oldPkg)) }
+
+                    an == "name" && isPermissionTag ->
+                        attrValue(a)?.let { setAttrString(a, renamePrefix(it, oldPkg, newPkg)) }
+
+                    an == "authorities" ->
+                        attrValue(a)?.let { setAttrString(a, renameAuthority(it, oldPkg, newPkg)) }
+
+                    an == "targetPackage" || an == "permission" ->
+                        attrValue(a)?.let { setAttrString(a, renamePrefix(it, oldPkg, newPkg)) }
+                }
+            }
+            chunk.attrs.removeAll(toRemove)
+        }
+    }
+
+    /** يجعل مكتبات .so تُستخرج عند التثبيت (يلزم بعد إعادة ضغط الحزمة). */
+    fun setExtractNativeLibs() {
+        val app = chunks.filterIsInstance<Element>().firstOrNull { elementName(it) == "application" }
+            ?: return
+        val existing = app.attrs.firstOrNull { attrName(it) == "extractNativeLibs" }
+        if (existing != null) {
+            existing.valueType = TYPE_INT_BOOLEAN
+            existing.valueData = 0xFFFFFFFF.toInt() // true
+            existing.rawValue = -1
+        } else {
+            app.attrs.add(
+                Attr(androidNs, addString("extractNativeLibs"), -1, TYPE_INT_BOOLEAN, 0xFFFFFFFF.toInt())
+            )
+        }
+    }
+
+    private fun addUsesPermissions(permissions: List<String>) {
+        if (permissions.isEmpty()) return
+        val manifestIndex = chunks.indexOfFirst { it is Element && elementName(it) == "manifest" }
+        if (manifestIndex < 0) return
+
+        var insertAt = manifestIndex + 1
+        for (permission in permissions) {
+            val alreadyThere = chunks.filterIsInstance<Element>().any {
+                elementName(it) == "uses-permission" &&
+                    it.attrs.any { a -> attrName(a) == "name" && attrValue(a) == permission }
+            }
+            if (alreadyThere) continue
+
+            val nameIndex = addString("uses-permission")
+            chunks.add(insertAt++, Element(-1, nameIndex, arrayListOf(stringAttr("name", permission))))
+            chunks.add(insertAt++, EndElement(-1, nameIndex))
+        }
+    }
+
+    private fun addInjectProvider(providerClass: String, authority: String) {
+        val appIndex = chunks.indexOfFirst { it is Element && elementName(it) == "application" }
+        if (appIndex < 0) return
+
+        val nameIndex = addString("provider")
+        val provider = Element(
+            ns = -1,
+            name = nameIndex,
+            attrs = arrayListOf(
+                stringAttr("name", providerClass),
+                stringAttr("authorities", authority),
+                boolAttr("exported", false),
+                boolAttr("enabled", true),
+            ),
+        )
+        chunks.add(appIndex + 1, provider)
+        chunks.add(appIndex + 2, EndElement(ns = -1, name = nameIndex))
+    }
+
+    private fun stringAttr(name: String, value: String): Attr {
+        val valueIndex = addString(value)
+        return Attr(
+            ns = androidNs,
+            name = addString(name),
+            rawValue = valueIndex,
+            valueType = TYPE_STRING,
+            valueData = valueIndex,
+        )
+    }
+
+    private fun boolAttr(name: String, value: Boolean) = Attr(
+        ns = androidNs,
+        name = addString(name),
+        rawValue = -1,
+        valueType = TYPE_INT_BOOLEAN,
+        valueData = if (value) 0xFFFFFFFF.toInt() else 0,
+    )
+
+    private fun renamePrefix(value: String, oldPkg: String, newPkg: String): String =
+        if (value.startsWith("$oldPkg.")) newPkg + value.substring(oldPkg.length) else value
+
+    private fun renameAuthority(value: String, oldPkg: String, newPkg: String): String {
+        // قد تحوي عدّة معرّفات مفصولة بـ ;
+        return value.split(';').joinToString(";") { renamePrefix(it.trim(), oldPkg, newPkg) }
+    }
+
+    /**
+     * أسماء المكوّنات يجب أن تبقى مُشيرة إلى أصناف الكود الأصلية، لأنّنا لا نغيّر
+     * أسماء الأصناف داخل dex. لذلك نحوّل الأسماء النسبية إلى أسماء مطلقة باسم
+     * الحزمة الأصلية، ونترك الأسماء المطلقة كما هي.
+     */
+    private fun resolveComponentName(value: String, oldPkg: String): String = when {
+        value.startsWith(".") -> oldPkg + value
+        !value.contains(".") -> "$oldPkg.$value"
+        else -> value
+    }
+
+    // -------------------------------------------------------------- serialize
+
+    fun toBytes(): ByteArray {
+        val out = ByteArrayOutputStream(original.size + 512)
+        val pool = buildStringPool()
+
+        // header مؤقت (نصحّح الحجم لاحقًا)
+        putU16(out, TYPE_XML)
+        putU16(out, 8)
+        putU32(out, 0)
+        out.write(pool)
+
+        for (chunk in chunks) {
+            when (chunk) {
+                is ByteArray -> out.write(chunk)
+                is Element -> out.write(serializeElement(chunk))
+                is EndElement -> out.write(serializeEndElement(chunk))
+            }
+        }
+
+        val bytes = out.toByteArray()
+        writeU32(bytes, 4, bytes.size)
+        return bytes
+    }
+
+    private fun buildStringPool(): ByteArray {
+        val data = ByteArrayOutputStream()
+        val offsets = IntArray(strings.size)
+        for (i in strings.indices) {
+            offsets[i] = data.size()
+            val s = strings[i]
+            val bytes = s.toByteArray(Charsets.UTF_8)
+            writeLen8(data, s.length)
+            writeLen8(data, bytes.size)
+            data.write(bytes)
+            data.write(0)
+        }
+        val dataBytes = data.toByteArray()
+        // يجب أن يكون حجم قطعة جدول النصوص من مضاعفات 4 (شرط AXML).
+        val padding = (4 - (dataBytes.size % 4)) % 4
+
+        val headerSize = 28
+        val offsetsSize = strings.size * 4
+        val stringsStart = headerSize + offsetsSize
+        val total = stringsStart + dataBytes.size + padding
+
+        val out = ByteArrayOutputStream(total)
+        putU16(out, TYPE_STRING_POOL)
+        putU16(out, headerSize)
+        putU32(out, total)
+        putU32(out, strings.size)
+        putU32(out, 0) // styleCount
+        putU32(out, UTF8_FLAG)
+        putU32(out, stringsStart)
+        putU32(out, 0) // stylesStart
+        for (o in offsets) putU32(out, o)
+        out.write(dataBytes)
+        repeat(padding) { out.write(0) }
+        return out.toByteArray()
+    }
+
+    private fun writeLen8(out: ByteArrayOutputStream, v: Int) {
+        if (v > 0x7F) {
+            out.write((v shr 8) or 0x80)
+            out.write(v and 0xFF)
+        } else {
+            out.write(v)
+        }
+    }
+
+    private fun serializeElement(e: Element): ByteArray {
+        val size = 16 + 20 + e.attrs.size * 20
+        val out = ByteArrayOutputStream(size)
+        putU16(out, TYPE_START_ELEMENT)
+        putU16(out, 16)
+        putU32(out, size)
+        putU32(out, -1) // lineNumber
+        putU32(out, -1) // comment
+        putU32(out, e.ns)
+        putU32(out, e.name)
+        putU16(out, 20) // attributeStart
+        putU16(out, 20) // attributeSize
+        putU16(out, e.attrs.size)
+        putU16(out, 0) // idIndex
+        putU16(out, 0) // classIndex
+        putU16(out, 0) // styleIndex
+        for (a in e.attrs) {
+            putU32(out, a.ns)
+            putU32(out, a.name)
+            putU32(out, a.rawValue)
+            putU16(out, 8) // typedValue size
+            out.write(0)   // res0
+            out.write(a.valueType)
+            putU32(out, a.valueData)
+        }
+        return out.toByteArray()
+    }
+
+    private fun serializeEndElement(e: EndElement): ByteArray {
+        val out = ByteArrayOutputStream(24)
+        putU16(out, TYPE_END_ELEMENT)
+        putU16(out, 16)
+        putU32(out, 24)
+        putU32(out, -1)
+        putU32(out, -1)
+        putU32(out, e.ns)
+        putU32(out, e.name)
+        return out.toByteArray()
+    }
+
+    private fun writeU32(bytes: ByteArray, pos: Int, v: Int) {
+        bytes[pos] = (v and 0xFF).toByte()
+        bytes[pos + 1] = ((v ushr 8) and 0xFF).toByte()
+        bytes[pos + 2] = ((v ushr 16) and 0xFF).toByte()
+        bytes[pos + 3] = ((v ushr 24) and 0xFF).toByte()
+    }
+
+    private fun putU16(out: ByteArrayOutputStream, v: Int) {
+        out.write(v and 0xFF)
+        out.write((v ushr 8) and 0xFF)
+    }
+
+    private fun putU32(out: ByteArrayOutputStream, v: Int) {
+        putU16(out, v and 0xFFFF)
+        putU16(out, (v ushr 16) and 0xFFFF)
+    }
+
+    // ------------------------------------------------------------- inner types
+
+    private class Attr(
+        var ns: Int,
+        var name: Int,
+        var rawValue: Int,
+        var valueType: Int,
+        var valueData: Int,
+    )
+
+    private class Element(val ns: Int, val name: Int, val attrs: ArrayList<Attr>)
+    private class EndElement(val ns: Int, val name: Int)
+
+    private companion object {
+        const val TYPE_XML = 0x0003
+        const val TYPE_STRING_POOL = 0x0001
+        const val TYPE_START_ELEMENT = 0x0102
+        const val TYPE_END_ELEMENT = 0x0103
+
+        const val UTF8_FLAG = 0x00000100
+        const val TYPE_STRING = 0x03
+        const val HOST_LOCATION_AUTHORITY = "com.abujhan.container.location"
+        const val TYPE_INT_BOOLEAN = 0x12
+
+        const val ANDROID_NS = "http://schemas.android.com/apk/res/android"
+
+        val COMPONENT_TAGS = setOf(
+            "application", "activity", "activity-alias", "service", "receiver", "provider",
+        )
+        val PERMISSION_TAGS = setOf(
+            "permission", "uses-permission", "permission-group", "permission-tree",
+        )
+    }
+}
+
+=== C:\Users\Msi\Desktop\flint\abujhan-container\app\src\main\java\com\abujhan\container\clone\ApkSignerHelper.kt ===
+package com.abujhan.container.clone
+
+import android.content.Context
+import com.android.apksig.ApkSigner
+import java.io.File
+
+/** يوقّع ملف APK (v1 + v2 + v3) بالمفتاح المدمج. */
+object ApkSignerHelper {
+
+    fun sign(context: Context, input: File, output: File, minSdk: Int) {
+        val material = KeystoreManager.load(context)
+        val signerConfig = ApkSigner.SignerConfig.Builder(
+            "ABUJHAN",
+            material.privateKey,
+            listOf(material.certificate),
+        ).build()
+
+        ApkSigner.Builder(listOf(signerConfig))
+            .setInputApk(input)
+            .setOutputApk(output)
+            .setV1SigningEnabled(true)
+            .setV2SigningEnabled(true)
+            .setV3SigningEnabled(true)
+            .setMinSdkVersion(minSdk)
+            .build()
+            .sign()
+    }
+}
+
+=== C:\Users\Msi\Desktop\flint\abujhan-container\app\src\main\java\com\abujhan\container\clone\ArscPatcher.kt ===
+package com.abujhan.container.clone
+
+/**
+ * رقّع `resources.arsc`: يغيّر اسم الحزمة داخل جدول الموارد.
+ *
+ * هذا ضروري لأنّ `Resources.getIdentifier(name, type, getPackageName())` يقارن
+ * اسم الحزمة المطلوب باسم الحزمة المخزَّن في resources.arsc. فإذا لم نغيّره
+ * يفشل البحث ويعيد 0 (ما يسبّب انهيارات مثل Resource ID #0x0).
+ *
+ * اسم الحزمة مخزَّن في حقل ثابت الطول (128 محرف UTF-16) داخل ResTable_package،
+ * لذا الاستبدال لا يغيّر أي أحجام أو إزاحات.
+ */
+object ArscPatcher {
+
+    private const val RES_TABLE_TYPE = 0x0002
+    private const val RES_TABLE_PACKAGE_TYPE = 0x0200
+    private const val PACKAGE_NAME_CHARS = 128
+
+    fun renamePackage(arsc: ByteArray, newPackage: String): Boolean {
+        if (arsc.size < 12) return false
+        if (u16(arsc, 0) != RES_TABLE_TYPE) return false
+
+        val headerSize = u16(arsc, 2)
+        var offset = headerSize
+        while (offset + 8 <= arsc.size) {
+            val type = u16(arsc, offset)
+            val size = u32(arsc, offset + 4)
+            if (type == RES_TABLE_PACKAGE_TYPE) {
+                val nameOffset = offset + 12 // type(2)+headerSize(2)+size(4)+id(4)
+                val nameEnd = nameOffset + PACKAGE_NAME_CHARS * 2
+                if (nameEnd > arsc.size) return false
+
+                for (i in 0 until PACKAGE_NAME_CHARS * 2) arsc[nameOffset + i] = 0
+                val bytes = newPackage.toByteArray(Charsets.UTF_16LE)
+                val copyLen = minOf(bytes.size, (PACKAGE_NAME_CHARS - 1) * 2)
+                System.arraycopy(bytes, 0, arsc, nameOffset, copyLen)
+                return true
+            }
+            if (size <= 0) break
+            offset += size
+        }
+        return false
+    }
+
+    private fun u16(d: ByteArray, off: Int): Int =
+        (d[off].toInt() and 0xFF) or ((d[off + 1].toInt() and 0xFF) shl 8)
+
+    private fun u32(d: ByteArray, off: Int): Int =
+        (d[off].toInt() and 0xFF) or
+            ((d[off + 1].toInt() and 0xFF) shl 8) or
+            ((d[off + 2].toInt() and 0xFF) shl 16) or
+            ((d[off + 3].toInt() and 0xFF) shl 24)
+}
+
+=== C:\Users\Msi\Desktop\flint\abujhan-container\app\src\main\java\com\abujhan\container\clone\CloneEngine.kt ===
+package com.abujhan.container.clone
+
+import android.content.Context
+import com.abujhan.container.clone.axml.AxmlEditor
+import com.abujhan.container.data.AppEntry
+import org.json.JSONObject
+import java.io.File
+import java.util.concurrent.Callable
+import java.util.concurrent.Executors
+
+/** ناتج الاستنساخ: الحزمة الأساسية + حِزم التقسيم (إن وُجدت). */
+class CloneOutput(val base: File, val splits: List<File>) {
+    val all: List<File> get() = listOf(base) + splits
+}
+
+/**
+ * محرّك الاستنساخ:
+ *
+ *  1) يقرأ كل مُدخلات APK الأصلي (الأساسية + التقسيمات).
+ *  2) يعدّل AndroidManifest.xml في كل ملف (اسم حزمة جديد).
+ *     - في الحزمة الأساسية فقط: يحقن مزوّد التهيئة ويصرّح برؤية مزوّد موقع ABUJHAN.
+ *  3) يحقن classesN.dex (وحدة الموقع) + ملف الإعدادات في الحزمة الأساسية.
+ *  4) يعيد بناء كل الحِزم ثم يوقّعها.
+ */
+class CloneEngine(private val context: Context) {
+
+    /** يُنشئ اسم حزمة فريدًا للنسخة. */
+    fun nextContainerPackage(originalPackage: String): String {
+        val pm = context.packageManager
+        var index = 1
+        while (true) {
+            val candidate = if (index == 1) "$originalPackage.clone"
+            else "$originalPackage.clone$index"
+            val installed = runCatching { pm.getPackageInfo(candidate, 0) }.isSuccess
+            if (!installed) return candidate
+            index++
+        }
+    }
+
+    fun build(entry: AppEntry, newPackage: String): CloneOutput {
+        val workDir = File(context.filesDir, "clones").apply { mkdirs() }
+
+        val base = processApk(
+            source = File(entry.apkPath),
+            oldPkg = entry.packageName,
+            newPkg = newPackage,
+            isBase = true,
+            fileLabel = "base",
+            workDir = workDir,
+        )
+
+        val splits = entry.splitPaths.mapIndexed { index, path ->
+            processApk(
+                source = File(path),
+                oldPkg = entry.packageName,
+                newPkg = newPackage,
+                isBase = false,
+                fileLabel = "split$index",
+                workDir = workDir,
+            )
+        }
+
+        return CloneOutput(base, splits)
+    }
+
+    private fun processApk(
+        source: File,
+        oldPkg: String,
+        newPkg: String,
+        isBase: Boolean,
+        fileLabel: String,
+        workDir: File,
+    ): File {
+        val t0 = System.nanoTime()
+        val entries = Zip.read(source)
+        val tRead = System.nanoTime()
+        val output = ArrayList<Zip.Entry>(entries.size + 2)
+        var sourceMinSdk: Int? = null
+        val cached = InjectionCache.load(context, oldPkg, source)
+        android.util.Log.i("CloneEngine", "scan cache ${if (cached != null) "hit" else "miss"}: ${source.name}")
+        val scanned = HashMap<String, Int>()
+        val dexRewrites = rewriteDexEntries(entries, source, oldPkg, cached)
+
+        var maxDex = 1
+        for (e in entries) {
+            val m = DEX_REGEX.find(e.name) ?: continue
+            val n = m.groupValues[1].let { if (it.isEmpty()) 1 else it.toIntOrNull() ?: 1 }
+            if (n > maxDex) maxDex = n
+        }
+        val injectDexName = "classes${maxDex + 1}.dex"
+
+        for (e in entries) {
+            when {
+                isSignatureFile(e.name) -> Unit // نتخلّص من التوقيع القديم
+
+                e.name == "AndroidManifest.xml" -> {
+                    val editor = AxmlEditor(e.data)
+                    sourceMinSdk = editor.minSdkVersion()
+                    if (isBase) {
+                        editor.patchForClone(
+                            oldPkg = oldPkg,
+                            newPkg = newPkg,
+                            injectProviderClass = INJECT_PROVIDER,
+                            providerAuthority = "$newPkg.inject",
+                            extraPermissions = EXTRA_PERMISSIONS,
+                        )
+                    } else {
+                        editor.renamePackage(oldPkg, newPkg)
+                    }
+                    output.add(Zip.Entry("AndroidManifest.xml", Zip.DEFLATED, editor.toBytes()))
+                }
+
+                e.name == "resources.arsc" -> {
+                    val patched = e.data.copyOf()
+                    ArscPatcher.renamePackage(patched, newPkg)
+                    output.add(Zip.Entry(e.name, Zip.STORED, patched))
+                }
+
+                DEX_REGEX.matches(e.name) && PATCH_SYSTEM_EXIT -> {
+                    // إعادة الكتابة أولًا على الملف الأصلي (لتفادي إفساد الترميز بالتعديل البايتي)،
+                    // ثم تعطيل System.exit على الناتج.
+                    val (rewritten, hooks) = dexRewrites.getValue(e.name)
+                    scanned[e.name] = hooks
+                    if (hooks > 0) {
+                        android.util.Log.i("CloneEngine", "hooked $hooks location call(s) in ${e.name}")
+                    }
+                    val count = DexPatcher.noOpSystemExit(rewritten)
+                    if (count > 0) {
+                        android.util.Log.i("CloneEngine", "disabled $count System.exit call(s) in ${e.name}")
+                    }
+                    output.add(Zip.Entry(e.name, Zip.DEFLATED, rewritten))
+                }
+
+                // تطبيقات Xamarin/Mono تقرأ assemblies.blob مباشرة من الـ APK، فيجب أن يبقى غير مضغوط.
+                e.name.startsWith("assemblies/") -> output.add(Zip.Entry(e.name, Zip.STORED, e.data))
+
+                else -> output.add(Zip.Entry(e.name, Zip.DEFLATED, e.data))
+            }
+        }
+
+        if (cached == null) {
+            InjectionCache.save(context, oldPkg, source, scanned)
+        }
+        val tProcess = System.nanoTime()
+
+        if (isBase) {
+            val injectDex = context.assets.open(INJECT_DEX_ASSET).use { it.readBytes() }
+            val config = JSONObject()
+                .put("package", newPkg)
+                .put("originalPackage", oldPkg)
+                .put("hostPackage", context.packageName)
+                .toString()
+                .toByteArray(Charsets.UTF_8)
+            output.add(Zip.Entry(injectDexName, Zip.DEFLATED, injectDex))
+            output.add(Zip.Entry("assets/abujhan_inject.json", Zip.DEFLATED, config))
+        }
+
+        val unsigned = File(workDir, "$newPkg.$fileLabel.unsigned.apk")
+        val signed = File(workDir, "$newPkg.$fileLabel.apk")
+        unsigned.delete()
+        signed.delete()
+
+        Zip.write(unsigned, output)
+        val tWrite = System.nanoTime()
+        val signMinSdk = sourceMinSdk ?: DEFAULT_MIN_SDK
+        ApkSignerHelper.sign(context, unsigned, signed, minSdk = signMinSdk)
+        val tSign = System.nanoTime()
+        fun ms(a: Long, b: Long) = (b - a) / 1_000_000
+        android.util.Log.i(
+            "CloneTiming",
+            "${source.name}: read=${ms(t0, tRead)}ms process=${ms(tRead, tProcess)}ms " +
+                "write=${ms(tProcess, tWrite)}ms sign=${ms(tWrite, tSign)}ms size=${source.length()}",
+        )
+        unsigned.delete()
+        return signed
+    }
+
+    /**
+     * يعالج ملفات dex بالتوازي (حتى DEX_THREADS ملفات في وقت واحد).
+     * كل ملف مستقل عن الآخر، لذا النتيجة لا تتغيّر، والزمن يقلّ.
+     */
+    private fun rewriteDexEntries(
+        entries: List<Zip.Entry>,
+        source: File,
+        oldPkg: String,
+        cached: Map<String, Int>?,
+    ): Map<String, Pair<ByteArray, Int>> {
+        val dexEntries = entries.filter { DEX_REGEX.matches(it.name) }
+        if (dexEntries.isEmpty()) return emptyMap()
+        val pool = Executors.newFixedThreadPool(DEX_THREADS)
+        try {
+            val futures = dexEntries.map { e ->
+                e.name to pool.submit(Callable { rewriteDex(e, source, oldPkg, cached) })
+            }
+            return futures.associate { (name, future) -> name to future.get() }
+        } finally {
+            pool.shutdown()
+        }
+    }
+
+    private fun rewriteDex(
+        e: Zip.Entry,
+        source: File,
+        oldPkg: String,
+        cached: Map<String, Int>?,
+    ): Pair<ByteArray, Int> {
+        val known = cached?.get(e.name)
+        // ملف معروف أنه بلا نداءات موقع: لا حاجة لفحصه.
+        if (known == 0) return e.data to 0
+        // ناتج محفوظ لهذا الإصدار والمحوّل: لا حاجة لإعادة الكتابة.
+        if (known != null) {
+            InjectionCache.loadRewritten(context, oldPkg, source, e.name)?.let { return it to known }
+        }
+        val started = System.nanoTime()
+        val (out, hooks) = SpoofRewriter.rewrite(e.data)
+        if (hooks > 0) InjectionCache.saveRewritten(context, oldPkg, source, e.name, out)
+        android.util.Log.i(
+            "CloneTiming",
+            "${e.name}: rewrite=${(System.nanoTime() - started) / 1_000_000}ms hooks=$hooks",
+        )
+        return out to hooks
+    }
+
+    private fun isSignatureFile(name: String): Boolean {
+        if (!name.startsWith("META-INF/")) return false
+        val upper = name.uppercase()
+        return upper.endsWith(".SF") || upper.endsWith(".RSA") ||
+            upper.endsWith(".DSA") || upper.endsWith(".EC") ||
+            upper.endsWith("MANIFEST.MF")
+    }
+
+    companion object {
+        const val INJECT_DEX_ASSET = "location_inject.dex"
+        private const val DEX_THREADS = 2
+        const val INJECT_PROVIDER = "com.container.inject.InjectProvider"
+        private const val DEFAULT_MIN_SDK = 26
+
+        /** النسخ لا تحتاج صلاحية الموقع الوهمي: المصدر الوحيد هو ABUJHAN. */
+        val EXTRA_PERMISSIONS: List<String> = emptyList()
+
+        /** تعطيل نداءات System.exit داخل النسخة (لتجاوز فحوص كشف التلاعب). */
+        const val PATCH_SYSTEM_EXIT = true
+
+        private val DEX_REGEX = Regex("^classes(\\d*)\\.dex$")
+    }
+}
+
+=== C:\Users\Msi\Desktop\flint\abujhan-container\app\src\main\java\com\abujhan\container\clone\CloneInstaller.kt ===
+package com.abujhan.container.clone
+
+import android.app.PendingIntent
+import android.content.Context
+import android.content.Intent
+import android.content.pm.PackageInstaller
+import com.abujhan.container.clone.CloneProgress.Phase
+import java.io.File
+
+/**
+ * يسلّم النسخة إلى مثبّت النظام عبر جلسة PackageInstaller (حزمة واحدة أو عدّة أجزاء).
+ *
+ * الجلسة تُرجع نتيجة التثبيت إلى CloneInstallReceiver، فنعرف متى يكتمل التثبيت أو يفشل.
+ * يجب استدعاء install() من خيط خلفي لأن نسخ الملفات قد يستغرق وقتًا.
+ */
+object CloneInstaller {
+
+    const val EXTRA_SESSION_ID = "session_id"
+    const val EXTRA_LABEL = "label"
+
+    fun install(context: Context, apks: List<File>, label: String) {
+        val installer = context.packageManager.packageInstaller
+        val total = apks.sumOf { it.length() }.coerceAtLeast(1L)
+        val params = PackageInstaller.SessionParams(PackageInstaller.SessionParams.MODE_FULL_INSTALL)
+        params.setSize(total)
+
+        val sessionId = installer.createSession(params)
+        CloneProgress.set(CloneProgress.State(label, Phase.INSTALLING, percent = 0))
+        installer.openSession(sessionId).use { session ->
+            var written = 0L
+            var lastReported = -1
+            val buffer = ByteArray(256 * 1024)
+            for (apk in apks) {
+                session.openWrite(apk.name, 0, apk.length()).use { output ->
+                    apk.inputStream().use { input ->
+                        while (true) {
+                            val read = input.read(buffer)
+                            if (read < 0) break
+                            output.write(buffer, 0, read)
+                            written += read
+                            val percent = (written * 100 / total).toInt()
+                            if (percent / 5 != lastReported / 5) {
+                                lastReported = percent
+                                CloneProgress.set(CloneProgress.State(label, Phase.INSTALLING, percent = percent))
+                            }
+                        }
+                    }
+                    session.fsync(output)
+                }
+            }
+
+            val intent = Intent(context, CloneInstallReceiver::class.java)
+                .putExtra(EXTRA_SESSION_ID, sessionId)
+                .putExtra(EXTRA_LABEL, label)
+            val flags = PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_MUTABLE
+            val pendingIntent = PendingIntent.getBroadcast(context, sessionId, intent, flags)
+            session.commit(pendingIntent.intentSender)
+        }
+    }
+
+    /** يُطلق التطبيق المستنسخ إن كان مثبّتًا. */
+    fun launch(context: Context, containerPackage: String): Boolean {
+        val intent = context.packageManager.getLaunchIntentForPackage(containerPackage) ?: return false
+        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        context.startActivity(intent)
+        return true
+    }
+
+    fun isInstalled(context: Context, containerPackage: String): Boolean =
+        runCatching { context.packageManager.getPackageInfo(containerPackage, 0) }.isSuccess
+}
+
+=== C:\Users\Msi\Desktop\flint\abujhan-container\app\src\main\java\com\abujhan\container\clone\CloneInstallReceiver.kt ===
+package com.abujhan.container.clone
+
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.pm.PackageInstaller
+import android.os.Build
+import android.util.Log
+import com.abujhan.container.clone.CloneProgress.Phase
+
+/**
+ * يستقبل نتيجة كل جلسة تثبيت للنسخ (حزمة واحدة أو عدّة أجزاء)
+ * ويحدّث نافذة التقدم داخل التطبيق.
+ *
+ * عند STATUS_PENDING_USER_ACTION يرسل النظام شاشة التأكيد في EXTRA_INTENT،
+ * ويجب تشغيلها وإلا لن يتم التثبيت أبدًا.
+ */
+class CloneInstallReceiver : BroadcastReceiver() {
+
+    override fun onReceive(context: Context, intent: Intent) {
+        val status = intent.getIntExtra(PackageInstaller.EXTRA_STATUS, PackageInstaller.STATUS_FAILURE)
+        val message = intent.getStringExtra(PackageInstaller.EXTRA_STATUS_MESSAGE)
+        val label = intent.getStringExtra(CloneInstaller.EXTRA_LABEL) ?: "التطبيق"
+        Log.i(TAG, "install status=$status label=$label message=$message")
+
+        when (status) {
+            PackageInstaller.STATUS_PENDING_USER_ACTION -> {
+                CloneProgress.set(CloneProgress.State(label, Phase.WAITING_CONFIRM))
+                val confirm = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    intent.getParcelableExtra(Intent.EXTRA_INTENT, Intent::class.java)
+                } else {
+                    @Suppress("DEPRECATION")
+                    intent.getParcelableExtra(Intent.EXTRA_INTENT)
+                }
+                if (confirm != null) {
+                    confirm.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    context.startActivity(confirm)
+                } else {
+                    CloneProgress.set(
+                        CloneProgress.State(label, Phase.FAILED, message = "تعذّر فتح شاشة التأكيد"),
+                    )
+                }
+            }
+
+            PackageInstaller.STATUS_SUCCESS ->
+                CloneProgress.set(CloneProgress.State(label, Phase.DONE, percent = 100))
+
+            else ->
+                CloneProgress.set(
+                    CloneProgress.State(label, Phase.FAILED, message = message ?: status.toString()),
+                )
+        }
+    }
+
+    private companion object {
+        const val TAG = "CloneInstall"
+    }
+}
+
+=== C:\Users\Msi\Desktop\flint\abujhan-container\app\src\main\java\com\abujhan\container\clone\CloneProgress.kt ===
+package com.abujhan.container.clone
+
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+
+/**
+ * حالة عملية الاستنساخ والتثبيت الحالية، تعرضها نافذة التقدم داخل التطبيق.
+ * null يعني لا توجد عملية جارية.
+ */
+object CloneProgress {
+
+    enum class Phase { CLONING, INSTALLING, WAITING_CONFIRM, DONE, FAILED }
+
+    /** percent = -1 يعني تقدّم غير محدد. */
+    data class State(
+        val label: String,
+        val phase: Phase,
+        val percent: Int = -1,
+        val message: String? = null,
+    )
+
+    private val _state = MutableStateFlow<State?>(null)
+    val state: StateFlow<State?> = _state.asStateFlow()
+
+    fun set(state: State?) {
+        _state.value = state
+    }
+}
+
+=== C:\Users\Msi\Desktop\flint\abujhan-container\app\src\main\java\com\abujhan\container\clone\DexPatcher.kt ===
+package com.abujhan.container.clone
+
+import java.security.MessageDigest
+import java.util.zip.Adler32
+
+/**
+ * رقّع DEX بسيط: يعطّل نداءات `System.exit(int)` بتحويلها إلى `return-void`.
+ *
+ * يُستخدم لتجاوز فحوص "كشف التلاعب" في بعض التطبيقات 
+ * تستدعي System.exit(0) عند فشل التحقّق من التوقيع.
+ *
+ * لا نستخدم محلّل DEX كاملًا؛ بل نجد فهرس الدالة System.exit(I)V من جدول
+ * الدوال، ثم نبحث عن ترميز نداء invoke-static لها ونستبدله بـ return-void.
+ */
+object DexPatcher {
+
+    /** @return عدد النداءات التي تمّ تعطيلها. */
+    fun noOpSystemExit(dex: ByteArray): Int {
+        if (dex.size < 112 || !isDex(dex)) return 0
+
+        val systemTypeIndex = findTypeIndex(dex, "Ljava/lang/System;") ?: return 0
+        val exitStringIndex = findStringIndex(dex, "exit") ?: return 0
+        val methodIndex = findMethodIndex(dex, systemTypeIndex, exitStringIndex) ?: return 0
+
+        var patched = 0
+        var i = 0
+        val limit = dex.size - 6
+        while (i <= limit) {
+            if (dex[i].toInt() and 0xFF == 0x71 && (dex[i + 1].toInt() and 0x0F) == 0x00) {
+                val idx = (dex[i + 2].toInt() and 0xFF) or ((dex[i + 3].toInt() and 0xFF) shl 8)
+                val unit2Low = dex[i + 4].toInt() and 0xFF
+                val unit2High = dex[i + 5].toInt() and 0xFF
+                if (idx == methodIndex && unit2High == 0x00 && unit2Low <= 0x0F && i % 2 == 0) {
+                    // return-void + nop + nop  (نفس حجم invoke-static)
+                    dex[i] = 0x0E
+                    dex[i + 1] = 0x00
+                    dex[i + 2] = 0x00
+                    dex[i + 3] = 0x00
+                    dex[i + 4] = 0x00
+                    dex[i + 5] = 0x00
+                    patched++
+                }
+            }
+            i++
+        }
+
+        if (patched > 0) fixDexChecksums(dex)
+        return patched
+    }
+
+    /** استبدال قيمة نصية بنفس الطول في الـ dex (بدون تغيير الفهارس). */
+    fun replaceString(dex: ByteArray, oldValue: String, newValue: String): Boolean {
+        val oldBytes = oldValue.toByteArray(Charsets.UTF_8)
+        val newBytes = newValue.toByteArray(Charsets.UTF_8)
+        if (oldBytes.size != newBytes.size) return false
+
+        val index = findStringIndex(dex, oldValue) ?: return false
+        val dataOff = u32(dex, stringIdsOff(dex) + index * 4)
+
+        var p = dataOff
+        while (p < dex.size && (dex[p].toInt() and 0x80) != 0) p++
+        p++ // تجاوز طول utf16
+
+        System.arraycopy(newBytes, 0, dex, p, newBytes.size)
+        fixDexChecksums(dex)
+        return true
+    }
+
+    // --------------------------------------------------------------- helpers
+
+    /** تشخيص (للتطوير). */
+    fun debug(dex: ByteArray): String {
+        val sb = StringBuilder()
+        sb.append("isDex=").append(isDex(dex)).append(" size=").append(dex.size).append('\n')
+        val s = findStringIndex(dex, "Ljava/lang/System;")
+        sb.append("systemStringIdx=").append(s).append('\n')
+        val t = findTypeIndex(dex, "Ljava/lang/System;")
+        sb.append("systemTypeIdx=").append(t).append('\n')
+        val ex = findStringIndex(dex, "exit")
+        sb.append("exitStringIdx=").append(ex).append('\n')
+        if (t != null && ex != null) {
+            val m = findMethodIndex(dex, t, ex)
+            sb.append("exitMethodIdx=").append(m).append('\n')
+            if (m != null) {
+                var raw = 0
+                var withArgs = 0
+                var i = 0
+                while (i < dex.size - 6) {
+                    if ((dex[i].toInt() and 0xFF) == 0x71) {
+                        val idx = (dex[i + 2].toInt() and 0xFF) or ((dex[i + 3].toInt() and 0xFF) shl 8)
+                        if (idx == m) {
+                            raw++
+                            val lo = dex[i + 4].toInt() and 0xFF
+                            val hi = dex[i + 5].toInt() and 0xFF
+                            if (hi == 0 && lo <= 0x0F) withArgs++
+                        }
+                    }
+                    i++
+                }
+                sb.append("rawMatches=").append(raw).append(" argMatches=").append(withArgs).append('\n')
+                var exact = 0
+                var evenOdd = ""
+                var i2 = 0
+                while (i2 < dex.size - 6) {
+                    if ((dex[i2].toInt() and 0xFF) == 0x71) {
+                        val idx = (dex[i2 + 2].toInt() and 0xFF) or ((dex[i2 + 3].toInt() and 0xFF) shl 8)
+                        if (idx == m) {
+                            val b1 = dex[i2 + 1].toInt() and 0x0F
+                            val lo = dex[i2 + 4].toInt() and 0xFF
+                            val hi = dex[i2 + 5].toInt() and 0xFF
+                            if (b1 == 0 && hi == 0 && lo <= 0x0F) {
+                                evenOdd += "off=$i2 parity=${i2 % 2} "
+                                if (i2 % 2 == 0) exact++
+                            }
+                        }
+                    }
+                    i2++
+                }
+                sb.append("exact=").append(exact).append(" detail=").append(evenOdd).append('\n')
+            }
+        }
+        return sb.toString()
+    }
+
+    private fun isDex(d: ByteArray): Boolean =
+        d[0] == 'd'.code.toByte() && d[1] == 'e'.code.toByte() &&
+            d[2] == 'x'.code.toByte() && d[3] == '\n'.code.toByte()
+
+    private fun u32(d: ByteArray, off: Int): Int =
+        (d[off].toInt() and 0xFF) or
+            ((d[off + 1].toInt() and 0xFF) shl 8) or
+            ((d[off + 2].toInt() and 0xFF) shl 16) or
+            ((d[off + 3].toInt() and 0xFF) shl 24)
+
+    private fun u16(d: ByteArray, off: Int): Int =
+        (d[off].toInt() and 0xFF) or ((d[off + 1].toInt() and 0xFF) shl 8)
+
+    private fun stringIdsSize(d: ByteArray) = u32(d, 56)
+    private fun stringIdsOff(d: ByteArray) = u32(d, 60)
+    private fun typeIdsSize(d: ByteArray) = u32(d, 64)
+    private fun typeIdsOff(d: ByteArray) = u32(d, 68)
+    private fun methodIdsSize(d: ByteArray) = u32(d, 88)
+    private fun methodIdsOff(d: ByteArray) = u32(d, 92)
+
+    private fun readString(d: ByteArray, index: Int): String? {
+        if (index < 0 || index >= stringIdsSize(d)) return null
+        val dataOff = u32(d, stringIdsOff(d) + index * 4)
+        var p = dataOff
+        // uleb128 (utf16 length) — نتجاهله
+        while (p < d.size && (d[p].toInt() and 0x80) != 0) p++
+        p++
+        // MUTF-8 حتى النهاية (0x00)
+        val out = StringBuilder()
+        while (p < d.size) {
+            val b = d[p].toInt() and 0xFF
+            if (b == 0) break
+            out.append(b.toChar())
+            p++
+        }
+        return out.toString()
+    }
+
+    private fun findStringIndex(d: ByteArray, value: String): Int? {
+        for (i in 0 until stringIdsSize(d)) {
+            if (readString(d, i) == value) return i
+        }
+        return null
+    }
+
+    private fun findTypeIndex(d: ByteArray, descriptor: String): Int? {
+        val stringIndex = findStringIndex(d, descriptor) ?: return null
+        for (i in 0 until typeIdsSize(d)) {
+            if (u32(d, typeIdsOff(d) + i * 4) == stringIndex) return i
+        }
+        return null
+    }
+
+    private fun findMethodIndex(d: ByteArray, classTypeIndex: Int, nameStringIndex: Int): Int? {
+        val base = methodIdsOff(d)
+        for (i in 0 until methodIdsSize(d)) {
+            val off = base + i * 8
+            val classIdx = u16(d, off)
+            val nameIdx = u32(d, off + 4)
+            if (classIdx == classTypeIndex && nameIdx == nameStringIndex) return i
+        }
+        return null
+    }
+
+    /** يعيد حساب checksum (Adler-32) و signature (SHA-1) ليبقى الملف صالحًا. */
+    private fun fixDexChecksums(d: ByteArray) {
+        val sha1 = MessageDigest.getInstance("SHA-1")
+        sha1.update(d, 32, d.size - 32)
+        val signature = sha1.digest()
+        System.arraycopy(signature, 0, d, 12, 20)
+
+        val adler = Adler32()
+        adler.update(d, 12, d.size - 12)
+        val value = adler.value.toInt()
+        d[8] = (value and 0xFF).toByte()
+        d[9] = ((value ushr 8) and 0xFF).toByte()
+        d[10] = ((value ushr 16) and 0xFF).toByte()
+        d[11] = ((value ushr 24) and 0xFF).toByte()
+    }
+}
+
+=== C:\Users\Msi\Desktop\flint\abujhan-container\app\src\main\java\com\abujhan\container\clone\InjectionCache.kt ===
+package com.abujhan.container.clone
+
+import android.content.Context
+import org.json.JSONObject
+import java.io.File
+
+/**
+ * يحفظ نتيجة فحص ملفات dex لكل APK أصلي: كم نداء موقع في كل ملف.
+ *
+ * المفتاح يشمل اسم الحزمة واسم الملف وحجمه وتاريخ تعديله، فإذا تغيّر إصدار التطبيق
+ * يتغيّر الملف ويُعاد الفحص تلقائيًا. بهذا لا يُفحص كل ملف dex عند كل استنساخ،
+ * والملفات التي لا تحتوي نداءات موقع تُنسخ مباشرة.
+ */
+object InjectionCache {
+
+    private const val DIR = "injection_cache"
+
+    /** يعيد عدد نداءات الموقع لكل ملف dex، أو null إن لم توجد نتيجة مطابقة. */
+    fun load(context: Context, packageName: String, apk: File): Map<String, Int>? {
+        val file = fileFor(context, packageName, apk)
+        if (!file.exists()) return null
+        return runCatching {
+            val json = JSONObject(file.readText())
+            if (json.optString("key") != keyOf(apk)) return null
+            val files = json.getJSONObject("files")
+            files.keys().asSequence().associateWith { files.getInt(it) }
+        }.getOrNull()
+    }
+
+    fun save(context: Context, packageName: String, apk: File, counts: Map<String, Int>) {
+        val files = JSONObject()
+        counts.forEach { (name, hooks) -> files.put(name, hooks) }
+        val json = JSONObject()
+            .put("key", keyOf(apk))
+            .put("files", files)
+        runCatching { fileFor(context, packageName, apk).writeText(json.toString()) }
+    }
+
+    /** الناتج المعاد كتابته لملف dex واحد، أو null إن لم يكن مخزّنًا لهذا الإصدار والمحوّل. */
+    fun loadRewritten(context: Context, packageName: String, apk: File, dexName: String): ByteArray? {
+        val file = rewrittenFile(context, packageName, apk, dexName)
+        return if (file.exists()) file.readBytes() else null
+    }
+
+    /** يحفظ الناتج، ويحذف نسخ الإصدارات القديمة لنفس الحزمة والملف. */
+    fun saveRewritten(context: Context, packageName: String, apk: File, dexName: String, bytes: ByteArray) {
+        runCatching {
+            val dir = File(context.filesDir, DIR).apply { mkdirs() }
+            dir.listFiles { f -> f.name.startsWith("$packageName.$dexName.") && f.name.endsWith(".rw") }
+                ?.forEach { it.delete() }
+            rewrittenFile(context, packageName, apk, dexName).writeBytes(bytes)
+        }
+    }
+
+    private fun rewrittenFile(context: Context, packageName: String, apk: File, dexName: String): File {
+        val dir = File(context.filesDir, DIR).apply { mkdirs() }
+        val tag = sha(keyOf(apk) + "|" + SpoofRewriter.FINGERPRINT).take(16)
+        return File(dir, "$packageName.$dexName.$tag.rw")
+    }
+
+    private fun sha(text: String): String =
+        java.security.MessageDigest.getInstance("SHA-256")
+            .digest(text.toByteArray(Charsets.UTF_8))
+            .joinToString("") { "%02x".format(it) }
+
+    private fun keyOf(apk: File): String = "${apk.name}|${apk.length()}|${apk.lastModified()}"
+
+    private fun fileFor(context: Context, packageName: String, apk: File): File {
+        val dir = File(context.filesDir, DIR).apply { mkdirs() }
+        return File(dir, "$packageName.${apk.name}.json")
+    }
+}
+
+=== C:\Users\Msi\Desktop\flint\abujhan-container\app\src\main\java\com\abujhan\container\clone\InstalledApps.kt ===
+package com.abujhan.container.clone
+
+import android.content.Context
+import android.content.Intent
+import android.content.pm.ApplicationInfo
+import android.content.pm.PackageManager
+import android.os.Build
+import com.abujhan.container.data.AppEntry
+
+/** يجمع كل التطبيقات التي لها أيقونة في المشغّل (launcher). */
+object InstalledApps {
+
+    fun load(context: Context): List<AppEntry> {
+        val pm = context.packageManager
+        val intent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+        val resolved = pm.queryIntentActivities(intent, PackageManager.MATCH_ALL)
+
+        val byPackage = LinkedHashMap<String, AppEntry>()
+        for (info in resolved) {
+            val app = info.activityInfo?.applicationInfo ?: continue
+            val pkg = app.packageName
+            if (pkg == context.packageName) continue
+            if (byPackage.containsKey(pkg)) continue
+
+            val label = runCatching { app.loadLabel(pm).toString() }.getOrDefault(pkg)
+            val icon = runCatching { app.loadIcon(pm) }.getOrNull()
+            val splits = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+                app.splitSourceDirs?.toList() ?: emptyList()
+            } else emptyList()
+            val system = (app.flags and ApplicationInfo.FLAG_SYSTEM) != 0
+
+            byPackage[pkg] = AppEntry(
+                label = label,
+                packageName = pkg,
+                apkPath = app.sourceDir,
+                splitPaths = splits,
+                icon = icon,
+                isSystem = system,
+            )
+        }
+        return byPackage.values.sortedBy { it.label.lowercase() }
+    }
+}
+
+=== C:\Users\Msi\Desktop\flint\abujhan-container\app\src\main\java\com\abujhan\container\clone\KeystoreManager.kt ===
+package com.abujhan.container.clone
+
+import android.content.Context
+import java.security.KeyStore
+import java.security.PrivateKey
+import java.security.cert.X509Certificate
+
+/**
+ * يحمّل مفتاح توقيع النسخ من الأصول (assets/clone_key.p12).
+ *
+ * كل النسخ تُوقَّع بنفس المفتاح، لذلك يمكن تحديث أي نسخة لاحقًا "في مكانها"
+ * دون إلغاء تثبيت. غيّر المفتاح إن أردت هويّة توقيع مختلفة.
+ */
+object KeystoreManager {
+
+    private const val ASSET = "clone_key.p12"
+    private const val PASSWORD = "abujhan123"
+    const val ALIAS = "clone"
+
+    class KeyMaterial(val privateKey: PrivateKey, val certificate: X509Certificate)
+
+    fun load(context: Context): KeyMaterial {
+        val ks = KeyStore.getInstance("PKCS12")
+        context.assets.open(ASSET).use { input ->
+            ks.load(input, PASSWORD.toCharArray())
+        }
+        val alias = ks.aliases().asSequence().firstOrNull()
+            ?: error("لا يوجد مفتاح في $ASSET")
+        val key = ks.getKey(alias, PASSWORD.toCharArray()) as PrivateKey
+        val cert = ks.getCertificate(alias) as X509Certificate
+        return KeyMaterial(key, cert)
+    }
+}
+
+=== C:\Users\Msi\Desktop\flint\abujhan-container\app\src\main\java\com\abujhan\container\clone\RootHelper.kt ===
+package com.abujhan.container.clone
+
+import android.util.Log
+import java.io.BufferedReader
+import java.io.InputStreamReader
+
+/**
+ * مساعد صلاحيات root (اختياري لكن مفيد جدًا).
+ *
+ * جهازك مروّت (Magisk)، لذلك يمكننا تلقائيًا:
+ *   - منح النسخة صلاحية "مصدر موقع وهمي" (appops android:mock_location).
+ *   - منح أذونات الموقع العادية.
+ *   - إيقاف النسخة قسرًا قبل تشغيلها.
+ *
+ * إن لم يتوفّر root فسيبقى المستخدم قادرًا على اختيار النسخة يدويًا من
+ * خيارات المطوّر ← تحديد تطبيق الموقع الوهمي (تظهر لأنّنا نضيف الصلاحية).
+ */
+object RootHelper {
+
+    private const val TAG = "RootHelper"
+
+    fun hasRoot(): Boolean = runCatching { exec("id").contains("uid=0") }.getOrDefault(false)
+
+    /** يمنح النسخة صلاحية الموقع الوهمي. */
+    fun grantMockLocation(containerPackage: String): Boolean {
+        runCatching { exec("appops set $containerPackage android:mock_location allow") }
+        val state = runCatching { exec("appops get $containerPackage android:mock_location") }
+            .getOrDefault("")
+        Log.i(TAG, "grantMockLocation($containerPackage) -> $state")
+        return state.contains("allow")
+    }
+
+    /** يسحب صلاحية الموقع الوهمي (يُعيد النظام إلى الوضع الطبيعي). */
+    fun revokeMockLocation(containerPackage: String): Boolean {
+        runCatching { exec("appops set $containerPackage android:mock_location ignore") }
+        Log.i(TAG, "revokeMockLocation($containerPackage)")
+        return true
+    }
+
+    /** يمنح أذونات الموقع العادية (تفشل بهدوء إن لم تكن معلنة). */
+    fun grantLocationPermissions(containerPackage: String) {
+        runCatching {
+            exec("pm grant $containerPackage android.permission.ACCESS_FINE_LOCATION")
+            exec("pm grant $containerPackage android.permission.ACCESS_COARSE_LOCATION")
+        }
+    }
+
+    /**
+     * يخفي الروت عن النسخة عبر قائمة الحجب في Magisk (Zygisk DenyList)،
+     * حتى لا تكتشف التطبيقات التي تفحص الروت.
+     */
+    fun hideRoot(containerPackage: String): Boolean {
+        val out = runCatching {
+            // بعض إصدارات Magisk تتطلّب تحديد العملية أيضًا.
+            exec("magisk --denylist add $containerPackage")
+            exec("magisk --denylist add $containerPackage $containerPackage")
+        }.getOrDefault("")
+        Log.i(TAG, "hideRoot($containerPackage) -> $out")
+        return true
+    }
+
+    /** يلغي تثبيت النسخة كاملة (مع كل أجزائها وبياناتها) بدون نافذة تأكيد. */
+    fun uninstallPackage(containerPackage: String): Boolean {
+        val out = runCatching { exec("pm uninstall $containerPackage") }.getOrDefault("")
+        Log.i(TAG, "uninstallPackage($containerPackage) -> $out")
+        return out.contains("Success")
+    }
+
+    fun forceStop(containerPackage: String) {
+        runCatching { exec("am force-stop $containerPackage") }
+    }
+
+    private fun exec(command: String): String {
+        val process = Runtime.getRuntime().exec(arrayOf("su", "-c", command))
+        val output = StringBuilder()
+        BufferedReader(InputStreamReader(process.inputStream)).use { reader ->
+            var line = reader.readLine()
+            while (line != null) {
+                output.append(line).append('\n')
+                line = reader.readLine()
+            }
+        }
+        process.waitFor()
+        return output.toString().trim()
+    }
+}
+
+=== C:\Users\Msi\Desktop\flint\abujhan-container\app\src\main\java\com\abujhan\container\clone\SpoofRewriter.kt ===
+package com.abujhan.container.clone
+
+import org.jf.dexlib2.Opcode
+import org.jf.dexlib2.Opcodes
+import org.jf.dexlib2.dexbacked.DexBackedDexFile
+import org.jf.dexlib2.iface.instruction.Instruction
+import org.jf.dexlib2.iface.instruction.formats.Instruction35c
+import org.jf.dexlib2.iface.instruction.formats.Instruction3rc
+import org.jf.dexlib2.iface.reference.MethodReference
+import org.jf.dexlib2.immutable.instruction.ImmutableInstruction35c
+import org.jf.dexlib2.immutable.instruction.ImmutableInstruction3rc
+import org.jf.dexlib2.immutable.reference.ImmutableMethodReference
+import org.jf.dexlib2.rewriter.DexRewriter
+import org.jf.dexlib2.rewriter.InstructionRewriter
+import org.jf.dexlib2.rewriter.RewriterModule
+import org.jf.dexlib2.rewriter.Rewriter
+import org.jf.dexlib2.rewriter.Rewriters
+import org.jf.dexlib2.writer.io.MemoryDataStore
+import org.jf.dexlib2.writer.pool.DexPool
+
+/**
+ * يعيد كتابة ملف dex للنسخة: يستبدل استدعاءات واجهات الموقع بنقاط الاعتراض في
+ * com.container.inject.LocationHook، فيحصل التطبيق على الموقع المزيّف.
+ *
+ * الاستدعاء الأصلي (virtual/interface) وبعده المعامِلات نفسها، والنقطة الجديدة (static)
+ * تأخذ المستقبِل أولًا كمعامِل عادي، لذا تبقى قائمة السجلات كما هي.
+ */
+object SpoofRewriter {
+
+    private const val HOOK = "Lcom/container/inject/LocationHook;"
+    private const val LOCATION = "Landroid/location/Location;"
+    private const val LOCATION_MANAGER = "Landroid/location/LocationManager;"
+    private const val LOCATION_LISTENER = "Landroid/location/LocationListener;"
+    private const val FUSED = "Lcom/google/android/gms/location/FusedLocationProviderClient;"
+    private const val LOCATION_REQUEST = "Lcom/google/android/gms/location/LocationRequest;"
+    private const val LOCATION_CALLBACK = "Lcom/google/android/gms/location/LocationCallback;"
+    private const val TASK = "Lcom/google/android/gms/tasks/Task;"
+    private const val LOOPER = "Landroid/os/Looper;"
+    private const val STRING = "Ljava/lang/String;"
+    private const val ANDROID_LOCATION_REQUEST = "Landroid/location/LocationRequest;"
+    private const val EXECUTOR = "Ljava/util/concurrent/Executor;"
+    private const val PLAY_SERVICES_LM = "Lcom/reactnativecommunity/geolocation/PlayServicesLocationManager;"
+
+    private val hookSignatures = ArrayList<String>()
+
+    private val targets: Map<String, ImmutableMethodReference> = mapOf(
+        // LocationManager
+        "$LOCATION_MANAGER->getLastKnownLocation($STRING)$LOCATION" to
+            hook("getLastKnownLocation", listOf(LOCATION_MANAGER, STRING), LOCATION),
+        "$LOCATION_MANAGER->requestLocationUpdates($STRING" + "JF$LOCATION_LISTENER)V" to
+            hook("requestLocationUpdates", listOf(LOCATION_MANAGER, STRING, "J", "F", LOCATION_LISTENER), "V"),
+        "$LOCATION_MANAGER->removeUpdates($LOCATION_LISTENER)V" to
+            hook("removeUpdates", listOf(LOCATION_MANAGER, LOCATION_LISTENER), "V"),
+        "$LOCATION_MANAGER->requestLocationUpdates($STRING" + "JF$LOCATION_LISTENER$LOOPER)V" to
+            hook("requestLocationUpdates", listOf(LOCATION_MANAGER, STRING, "J", "F", LOCATION_LISTENER, LOOPER), "V"),
+        "$LOCATION_MANAGER->requestLocationUpdates($STRING$ANDROID_LOCATION_REQUEST$EXECUTOR$LOCATION_LISTENER)V" to
+            hook(
+                "requestLocationUpdates",
+                listOf(LOCATION_MANAGER, STRING, ANDROID_LOCATION_REQUEST, EXECUTOR, LOCATION_LISTENER),
+                "V",
+            ),
+
+        // Fused (Google Play Services)
+        "$FUSED->getLastLocation()$TASK" to
+            hook("getLastLocation", listOf(FUSED), TASK),
+        "$FUSED->requestLocationUpdates($LOCATION_REQUEST$LOCATION_CALLBACK$LOOPER)$TASK" to
+            hook("requestLocationUpdates", listOf(FUSED, LOCATION_REQUEST, LOCATION_CALLBACK, LOOPER), TASK),
+        "$FUSED->removeLocationUpdates($LOCATION_CALLBACK)$TASK" to
+            hook("removeLocationUpdates", listOf(FUSED, LOCATION_CALLBACK), TASK),
+
+        // React Native geolocation (يستدعيه التطبيق بـ invoke-direct)
+        "$PLAY_SERVICES_LM->requestLocationUpdates($LOCATION_REQUEST$LOCATION_CALLBACK)V" to
+            hook("requestPlayServicesUpdates", listOf("Ljava/lang/Object;", LOCATION_REQUEST, LOCATION_CALLBACK), "V"),
+    )
+
+    private fun hook(name: String, params: List<String>, ret: String): ImmutableMethodReference {
+        hookSignatures.add("$name(${params.joinToString("")})$ret")
+        return ImmutableMethodReference(HOOK, name, params, ret)
+    }
+
+    /**
+     * بصمة قائمة الأهداف ونقاط الاعتراض. تتغيّر تلقائيًا عند تعديل أي هدف،
+     * فلا يُستخدم ناتج قديم من التخزين المؤقت.
+     */
+    val FINGERPRINT: String by lazy {
+        val description = targets.keys.sorted().joinToString("\n") + "\n" +
+            hookSignatures.sorted().joinToString("\n")
+        java.security.MessageDigest.getInstance("SHA-256")
+            .digest(description.toByteArray(Charsets.UTF_8))
+            .joinToString("") { "%02x".format(it) }
+            .take(16)
+    }
+
+    /** يعيد dex جديدًا، ومعه عدد نقاط الاعتراض التي استُبدلت. */
+    fun rewrite(dex: ByteArray): Pair<ByteArray, Int> {
+        val opcodes = Opcodes.getDefault()
+        val input = DexBackedDexFile(opcodes, dex)
+        if (!containsTarget(input)) {
+            return dex to 0
+        }
+
+        var replaced = 0
+        val module = object : RewriterModule() {
+            override fun getInstructionRewriter(rewriters: Rewriters): Rewriter<Instruction> =
+                object : InstructionRewriter(rewriters) {
+                    override fun rewrite(insn: Instruction): Instruction {
+                        if (insn is Instruction35c && isVirtual(insn.opcode)) {
+                            val target = targetOf(insn.reference)
+                            if (target != null) {
+                                replaced++
+                                return ImmutableInstruction35c(
+                                    Opcode.INVOKE_STATIC,
+                                    insn.registerCount,
+                                    insn.registerC,
+                                    insn.registerD,
+                                    insn.registerE,
+                                    insn.registerF,
+                                    insn.registerG,
+                                    target,
+                                )
+                            }
+                        }
+                        if (insn is Instruction3rc && isVirtualRange(insn.opcode)) {
+                            val target = targetOf(insn.reference)
+                            if (target != null) {
+                                replaced++
+                                return ImmutableInstruction3rc(
+                                    Opcode.INVOKE_STATIC_RANGE,
+                                    insn.startRegister,
+                                    insn.registerCount,
+                                    target,
+                                )
+                            }
+                        }
+                        return super.rewrite(insn)
+                    }
+                }
+        }
+
+        val rewritten = DexRewriter(module).dexFileRewriter.rewrite(input)
+        val store = MemoryDataStore()
+        DexPool.writeTo(store, rewritten)
+        return store.data to replaced
+    }
+
+    private fun isVirtual(op: Opcode) =
+        op == Opcode.INVOKE_VIRTUAL || op == Opcode.INVOKE_INTERFACE || op == Opcode.INVOKE_DIRECT
+
+    private fun isVirtualRange(op: Opcode) =
+        op == Opcode.INVOKE_VIRTUAL_RANGE || op == Opcode.INVOKE_INTERFACE_RANGE || op == Opcode.INVOKE_DIRECT_RANGE
+
+    private fun targetOf(ref: Any?): ImmutableMethodReference? {
+        if (ref !is MethodReference) return null
+        return targets[signature(ref)]
+    }
+
+    private fun signature(ref: MethodReference): String =
+        "${ref.definingClass}->${ref.name}(${ref.parameterTypes.joinToString("")})${ref.returnType}"
+
+    private fun containsTarget(dex: DexBackedDexFile): Boolean =
+        dex.classes.any { cls ->
+            cls.methods.any { method ->
+                method.implementation?.instructions?.any { insn ->
+                    (insn is Instruction35c || insn is Instruction3rc) &&
+                        targetOf((insn as org.jf.dexlib2.iface.instruction.ReferenceInstruction).reference) != null
+                } == true
+            }
+        }
+}
+
+=== C:\Users\Msi\Desktop\flint\abujhan-container\app\src\main\java\com\abujhan\container\clone\Zip.kt ===
+package com.abujhan.container.clone
+
+import java.io.ByteArrayOutputStream
+import java.io.File
+import java.io.FileOutputStream
+import java.io.FilterOutputStream
+import java.io.OutputStream
+import java.util.zip.CRC32
+import java.util.zip.Deflater
+import java.util.zip.ZipEntry
+import java.util.zip.ZipFile
+
+/**
+ * قارئ/كاتب ZIP بسيط ومتحكَّم به، لأنّ بناء نسخة صالحة للتثبيت يتطلّب:
+ *  - أن يبقى resources.arsc مخزَّنًا (STORED) ومحاذيًا إلى 4 بايتات
+ *    (متطلَّب في أندرويد 11+).
+ *
+ * نستخدم حقلًا إضافيًا (extra field) معرّفه 0xD935 (نفس ما يفعله zipalign)
+ * لضبط المحاذاة.
+ */
+object Zip {
+
+    const val STORED = 0
+    const val DEFLATED = 8
+
+    class Entry(val name: String, val method: Int, val data: ByteArray)
+
+    fun read(file: File): List<Entry> {
+        val out = ArrayList<Entry>()
+        ZipFile(file).use { zf ->
+            val en = zf.entries()
+            while (en.hasMoreElements()) {
+                val e = en.nextElement()
+                if (e.isDirectory) continue
+                val bytes = zf.getInputStream(e).use { it.readBytes() }
+                val method = if (e.method == ZipEntry.STORED) STORED else DEFLATED
+                out.add(Entry(e.name, method, bytes))
+            }
+        }
+        return out
+    }
+
+    fun write(file: File, entries: List<Entry>) {
+        val out = CountingOutputStream(FileOutputStream(file))
+        val central = ArrayList<CentralRecord>()
+
+        for (e in entries) {
+            val nameBytes = e.name.toByteArray(Charsets.UTF_8)
+            val crc = crc32(e.data)
+            val stored = e.method == STORED
+            val payload = if (stored) e.data else deflate(e.data)
+
+            var extra = ByteArray(0)
+            if (stored && e.name == "resources.arsc") {
+                val base = out.count + 30 + nameBytes.size
+                val need = (4 - (base % 4)) % 4
+                if (need > 0) {
+                    extra = ByteArray(4 + need)
+                    extra[0] = 0x35
+                    extra[1] = 0xD9.toByte()
+                    extra[2] = (need and 0xFF).toByte()
+                    extra[3] = ((need ushr 8) and 0xFF).toByte()
+                }
+            }
+
+            val localOffset = out.count
+            val lh = ByteArrayOutputStream()
+            putU32(lh, 0x04034b50)
+            putU16(lh, 20)
+            putU16(lh, 0)
+            putU16(lh, if (stored) STORED else DEFLATED)
+            putU16(lh, 0)      // mod time
+            putU16(lh, 0x0021) // mod date (1980-01-01)
+            putU32(lh, crc)
+            putU32(lh, payload.size)
+            putU32(lh, e.data.size)
+            putU16(lh, nameBytes.size)
+            putU16(lh, extra.size)
+            out.write(lh.toByteArray())
+            out.write(nameBytes)
+            out.write(extra)
+            out.write(payload)
+
+            central.add(
+                CentralRecord(nameBytes, extra, crc, payload.size, e.data.size, stored, localOffset)
+            )
+        }
+
+        val cdStart = out.count
+        for (c in central) {
+            val rec = ByteArrayOutputStream()
+            putU32(rec, 0x02014b50)
+            putU16(rec, 20) // version made by
+            putU16(rec, 20) // version needed
+            putU16(rec, 0)  // flags
+            putU16(rec, if (c.stored) STORED else DEFLATED)
+            putU16(rec, 0)
+            putU16(rec, 0x0021)
+            putU32(rec, c.crc)
+            putU32(rec, c.compSize)
+            putU32(rec, c.uncompSize)
+            putU16(rec, c.nameBytes.size)
+            putU16(rec, c.extra.size)
+            putU16(rec, 0) // comment length
+            putU16(rec, 0) // disk number start
+            putU16(rec, 0) // internal attrs
+            putU32(rec, 0) // external attrs
+            putU32(rec, c.localOffset)
+            out.write(rec.toByteArray())
+            out.write(c.nameBytes)
+            out.write(c.extra)
+        }
+        val cdSize = out.count - cdStart
+
+        val eocd = ByteArrayOutputStream()
+        putU32(eocd, 0x06054b50)
+        putU16(eocd, 0)
+        putU16(eocd, 0)
+        putU16(eocd, central.size)
+        putU16(eocd, central.size)
+        putU32(eocd, cdSize)
+        putU32(eocd, cdStart)
+        putU16(eocd, 0)
+        out.write(eocd.toByteArray())
+
+        out.flush()
+        out.close()
+    }
+
+    private fun crc32(data: ByteArray): Int {
+        val c = CRC32()
+        c.update(data)
+        return c.value.toInt()
+    }
+
+    private fun deflate(data: ByteArray): ByteArray {
+        val deflater = Deflater(Deflater.DEFAULT_COMPRESSION, true)
+        deflater.setInput(data)
+        deflater.finish()
+        val out = ByteArrayOutputStream(data.size / 2 + 64)
+        val buf = ByteArray(64 * 1024)
+        while (!deflater.finished()) {
+            val n = deflater.deflate(buf)
+            out.write(buf, 0, n)
+        }
+        deflater.end()
+        return out.toByteArray()
+    }
+
+    private class CentralRecord(
+        val nameBytes: ByteArray,
+        val extra: ByteArray,
+        val crc: Int,
+        val compSize: Int,
+        val uncompSize: Int,
+        val stored: Boolean,
+        val localOffset: Int,
+    )
+
+    private class CountingOutputStream(out: OutputStream) : FilterOutputStream(out) {
+        var count = 0
+            private set
+
+        override fun write(b: Int) {
+            out.write(b)
+            count++
+        }
+
+        override fun write(b: ByteArray, off: Int, len: Int) {
+            out.write(b, off, len)
+            count += len
+        }
+    }
+
+    private fun putU16(out: ByteArrayOutputStream, v: Int) {
+        out.write(v and 0xFF)
+        out.write((v ushr 8) and 0xFF)
+    }
+
+    private fun putU32(out: ByteArrayOutputStream, v: Int) {
+        putU16(out, v and 0xFFFF)
+        putU16(out, (v ushr 16) and 0xFFFF)
+    }
+}
+
+=== C:\Users\Msi\Desktop\flint\abujhan-container\app\src\main\java\com\abujhan\container\data\AppEntry.kt ===
+package com.abujhan.container.data
+
+import android.graphics.drawable.Drawable
+
+/**
+ * تطبيق مثبّت على الجهاز، جاهز للاستنساخ.
+ *
+ * @param apkPath   مسار ملف APK الأساسي (sourceDir).
+ * @param splitPaths مسارات حِزم التقسيم (split APKs) إن وُجدت.
+ */
+data class AppEntry(
+    val label: String,
+    val packageName: String,
+    val apkPath: String,
+    val splitPaths: List<String>,
+    val icon: Drawable?,
+    val isSystem: Boolean,
+) {
+    /** بعض التطبيقات الحديثة تأتي مقسّمة إلى عدّة APK ولا تعمل نسخة الأساس وحدها. */
+    val isSplit: Boolean get() = splitPaths.isNotEmpty()
+}
+
+=== C:\Users\Msi\Desktop\flint\abujhan-container\app\src\main\java\com\abujhan\container\data\ContainerRecord.kt ===
+package com.abujhan.container.data
+
+/**
+ * حاوية (نسخة) أنشأها المستخدم من تطبيق أصلي.
+ *
+ * @param apkPaths مسارات ملفات APK للنسخة (الأساسية + التقسيمات).
+ */
+data class ContainerRecord(
+    val originalPackage: String,
+    val containerPackage: String,
+    val label: String,
+    val apkPaths: List<String>,
+    var latitude: Double? = null,
+    var longitude: Double? = null,
+    var accuracy: Float = 5f,
+    /** طُلب حذف النسخة من الجهاز ولم يكتمل بعد. */
+    var pendingDelete: Boolean = false,
+) {
+    val hasLocation: Boolean get() = latitude != null && longitude != null
+}
+
+=== C:\Users\Msi\Desktop\flint\abujhan-container\app\src\main\java\com\abujhan\container\data\ContainerStore.kt ===
+package com.abujhan.container.data
+
+import android.content.Context
+import org.json.JSONArray
+import org.json.JSONObject
+
+/**
+ * تخزين بسيط للحاويات في SharedPreferences بصيغة JSON.
+ * (بديل خفيف عن Room لتبقى قابليّة التعديل سهلة.)
+ */
+class ContainerStore(context: Context) {
+
+    private val prefs = context.applicationContext
+        .getSharedPreferences("containers", Context.MODE_PRIVATE)
+
+    fun all(): MutableList<ContainerRecord> {
+        val raw = prefs.getString(KEY, null) ?: return mutableListOf()
+        return try {
+            val arr = JSONArray(raw)
+            MutableList(arr.length()) { i ->
+                val o = arr.getJSONObject(i)
+                ContainerRecord(
+                    originalPackage = o.getString("originalPackage"),
+                    containerPackage = o.getString("containerPackage"),
+                    label = o.optString("label"),
+                    apkPaths = o.optJSONArray("apkPaths")?.let { a ->
+                        List(a.length()) { j -> a.getString(j) }
+                    } ?: emptyList(),
+                    latitude = if (o.has("lat")) o.getDouble("lat") else null,
+                    longitude = if (o.has("lng")) o.getDouble("lng") else null,
+                    accuracy = o.optDouble("accuracy", 5.0).toFloat(),
+                    pendingDelete = o.optBoolean("pendingDelete", false),
+                )
+            }
+        } catch (t: Throwable) {
+            mutableListOf()
+        }
+    }
+
+    fun get(containerPackage: String): ContainerRecord? =
+        all().firstOrNull { it.containerPackage == containerPackage }
+
+    fun upsert(record: ContainerRecord) {
+        val list = all()
+        val idx = list.indexOfFirst { it.containerPackage == record.containerPackage }
+        if (idx >= 0) list[idx] = record else list.add(record)
+        persist(list)
+    }
+
+    fun remove(containerPackage: String) {
+        val list = all()
+        list.removeAll { it.containerPackage == containerPackage }
+        persist(list)
+    }
+
+    fun setPendingDelete(containerPackage: String, pending: Boolean) {
+        val list = all()
+        list.firstOrNull { it.containerPackage == containerPackage }?.pendingDelete = pending
+        persist(list)
+    }
+
+    private fun persist(list: List<ContainerRecord>) {
+        val arr = JSONArray()
+        for (r in list) {
+            val o = JSONObject()
+            o.put("originalPackage", r.originalPackage)
+            o.put("containerPackage", r.containerPackage)
+            o.put("label", r.label)
+            o.put("apkPaths", JSONArray(r.apkPaths))
+            r.latitude?.let { o.put("lat", it) }
+            r.longitude?.let { o.put("lng", it) }
+            o.put("accuracy", r.accuracy.toDouble())
+            o.put("pendingDelete", r.pendingDelete)
+            arr.put(o)
+        }
+        prefs.edit().putString(KEY, arr.toString()).apply()
+    }
+
+    private companion object {
+        const val KEY = "records"
+    }
+}
+
+=== C:\Users\Msi\Desktop\flint\abujhan-container\app\src\main\java\com\abujhan\container\location\FavoriteStore.kt ===
+package com.abujhan.container.location
+
+import android.content.Context
+import org.json.JSONArray
+import org.json.JSONObject
+
+/** موقع محفوظ في المفضلة. */
+data class Favorite(val name: String, val lat: Double, val lng: Double, val accuracy: Float)
+
+object FavoriteStore {
+
+    private const val PREFS = "mock_favorites"
+    private const val KEY = "items"
+
+    fun all(context: Context): List<Favorite> {
+        val raw = prefs(context).getString(KEY, "[]") ?: "[]"
+        val array = JSONArray(raw)
+        return (0 until array.length()).map { i ->
+            val o = array.getJSONObject(i)
+            Favorite(o.getString("name"), o.getDouble("lat"), o.getDouble("lng"), o.getDouble("acc").toFloat())
+        }
+    }
+
+    fun add(context: Context, favorite: Favorite) {
+        write(context, all(context) + favorite)
+    }
+
+    fun remove(context: Context, index: Int) {
+        val list = all(context).toMutableList()
+        if (index in list.indices) list.removeAt(index)
+        write(context, list)
+    }
+
+    private fun write(context: Context, list: List<Favorite>) {
+        val array = JSONArray()
+        list.forEach {
+            array.put(
+                JSONObject()
+                    .put("name", it.name)
+                    .put("lat", it.lat)
+                    .put("lng", it.lng)
+                    .put("acc", it.accuracy.toDouble()),
+            )
+        }
+        prefs(context).edit().putString(KEY, array.toString()).apply()
+    }
+
+    private fun prefs(context: Context) = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+}
+
+=== C:\Users\Msi\Desktop\flint\abujhan-container\app\src\main\java\com\abujhan\container\location\LocationProvider.kt ===
+package com.abujhan.container.location
+
+import android.content.ContentProvider
+import android.content.ContentValues
+import android.database.Cursor
+import android.database.MatrixCursor
+import android.net.Uri
+
+/**
+ * ينشر الموقع الوهمي الحالي للنسخ عبر content://com.abujhan.container.location/current.
+ * تقرأه نقاط الاعتراض داخل كل نسخة (LocationHook)، فلا تحتاج النسخ إلى root أو خيارات المطوّر.
+ */
+class LocationProvider : ContentProvider() {
+
+    override fun onCreate(): Boolean = true
+
+    override fun query(
+        uri: Uri,
+        projection: Array<out String>?,
+        selection: String?,
+        selectionArgs: Array<out String>?,
+        sortOrder: String?,
+    ): Cursor? {
+        val context = context ?: return null
+        val cursor = MatrixCursor(arrayOf("lat", "lng", "acc", "active"))
+        val point = MockLocationStore.load(context)
+        val active = MockLocationStore.isActive(context) && point != null
+        cursor.addRow(
+            arrayOf(
+                point?.lat ?: 0.0,
+                point?.lng ?: 0.0,
+                point?.accuracy ?: 5f,
+                if (active) 1 else 0,
+            )
+        )
+        return cursor
+    }
+
+    override fun getType(uri: Uri): String? = null
+
+    override fun insert(uri: Uri, values: ContentValues?): Uri? = null
+
+    override fun delete(uri: Uri, selection: String?, selectionArgs: Array<out String>?): Int = 0
+
+    override fun update(
+        uri: Uri,
+        values: ContentValues?,
+        selection: String?,
+        selectionArgs: Array<out String>?,
+    ): Int = 0
+}
+
+=== C:\Users\Msi\Desktop\flint\abujhan-container\app\src\main\java\com\abujhan\container\location\MockLocationService.kt ===
+package com.abujhan.container.location
+
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.Service
+import android.content.Context
+import android.content.Intent
+import android.location.Criteria
+import android.location.Location
+import android.location.LocationManager
+import android.os.Build
+import android.os.Handler
+import android.os.IBinder
+import android.os.Looper
+import android.os.SystemClock
+import android.util.Log
+import androidx.core.app.NotificationCompat
+import com.abujhan.container.R
+
+/**
+ * يعمل كتطبيق الموقع الوهمي للنظام (ABUJHAN هو المصدر الوحيد).
+ * كل التطبيقات، بما فيها النسخ، تقرأ الموقع من النظام فتحصل على الموقع الوهمي.
+ *
+ * يتطلّب أن يكون ABUJHAN مختارًا كتطبيق موقع وهمي؛ على الجهاز المروّت
+ * يُمنح ذلك تلقائيًا عبر appops.
+ */
+class MockLocationService : Service() {
+
+    private val handler = Handler(Looper.getMainLooper())
+    private val ticker = object : Runnable {
+        override fun run() {
+            push()
+            handler.postDelayed(this, INTERVAL_MS)
+        }
+    }
+
+    override fun onCreate() {
+        super.onCreate()
+        val channel = NotificationChannel(CHANNEL_ID, getString(R.string.app_name), NotificationManager.IMPORTANCE_LOW)
+        getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent?.action == ACTION_STOP) {
+            stopMocking()
+            return START_NOT_STICKY
+        }
+        // إعادة التشغيل التلقائي بعد قتل النظام للخدمة لا تُفعّل الموقع الوهمي بعد أن أوقفه المستخدم.
+        if (!MockLocationStore.isActive(this)) {
+            stopSelf()
+            return START_NOT_STICKY
+        }
+        try {
+            startForeground(NOTIFICATION_ID, notification())
+        } catch (t: SecurityException) {
+            // إذن الموقع غير ممنوح بعد؛ نوقف الخدمة بدل الانهيار.
+            Log.w(TAG, "location permission missing: $t")
+            stopSelf()
+            return START_NOT_STICKY
+        }
+        handler.removeCallbacks(ticker)
+        handler.post(ticker)
+        return START_STICKY
+    }
+
+    override fun onDestroy() {
+        handler.removeCallbacks(ticker)
+        super.onDestroy()
+    }
+
+    /** يوقف البث ويزيل مزوّدات الاختبار فيعود الموقع الحقيقي للنظام. */
+    private fun stopMocking() {
+        MockLocationStore.setActive(this, false)
+        handler.removeCallbacks(ticker)
+        val lm = getSystemService(Context.LOCATION_SERVICE) as? LocationManager
+        for (provider in PROVIDERS) {
+            try {
+                lm?.setTestProviderEnabled(provider, false)
+                lm?.removeTestProvider(provider)
+            } catch (t: Throwable) {
+                Log.w(TAG, "remove $provider: $t")
+            }
+        }
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        stopSelf()
+    }
+
+    override fun onBind(intent: Intent?): IBinder? = null
+
+    private fun notification(): Notification =
+        NotificationCompat.Builder(this, CHANNEL_ID)
+            .setContentTitle(getString(R.string.app_name))
+            .setContentText(getString(R.string.mock_running))
+            .setSmallIcon(android.R.drawable.ic_menu_mylocation)
+            .setOngoing(true)
+            .build()
+
+    private fun push() {
+        val point = MockLocationStore.load(this) ?: return
+        val lm = getSystemService(Context.LOCATION_SERVICE) as? LocationManager ?: return
+        for (provider in PROVIDERS) {
+            try {
+                // استدعاؤه دائمًا يحوّل المزوّد إلى مزوّد اختبار.
+                lm.addTestProvider(
+                    provider, false, false, false, false, true, true, true,
+                    Criteria.POWER_LOW, Criteria.ACCURACY_FINE,
+                )
+            } catch (t: Throwable) {
+                Log.w(TAG, "addTestProvider $provider: $t")
+            }
+            try {
+                lm.setTestProviderEnabled(provider, true)
+                lm.setTestProviderLocation(provider, buildLocation(provider, point))
+            } catch (t: Throwable) {
+                Log.w(TAG, "provider $provider: $t")
+            }
+        }
+    }
+
+    private fun buildLocation(provider: String, point: MockPoint): Location {
+        val location = Location(provider)
+        location.latitude = point.lat
+        location.longitude = point.lng
+        location.accuracy = point.accuracy
+        location.time = System.currentTimeMillis()
+        location.elapsedRealtimeNanos = SystemClock.elapsedRealtimeNanos()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            location.verticalAccuracyMeters = 1f
+            location.speedAccuracyMetersPerSecond = 1f
+            location.bearingAccuracyDegrees = 1f
+        }
+        return location
+    }
+
+    companion object {
+        private const val TAG = "MockLocationService"
+        private const val CHANNEL_ID = "mock_location"
+        private const val NOTIFICATION_ID = 7001
+        private const val INTERVAL_MS = 1000L
+        private val PROVIDERS = listOf(
+            LocationManager.GPS_PROVIDER,
+            LocationManager.NETWORK_PROVIDER,
+            "fused",
+        )
+
+        const val ACTION_STOP = "com.abujhan.container.action.STOP_MOCK"
+
+        /** يحفظ الموقع ويشغّل الخدمة. */
+        fun activate(context: Context, point: MockPoint) {
+            MockLocationStore.save(context, point)
+            MockLocationStore.setActive(context, true)
+            val intent = Intent(context, MockLocationService::class.java)
+            context.startForegroundService(intent)
+        }
+
+        /** يوقف الموقع الوهمي فورًا (يُرسل أمر الإيقاف إلى الخدمة). */
+        fun deactivate(context: Context) {
+            MockLocationStore.setActive(context, false)
+            val intent = Intent(context, MockLocationService::class.java).setAction(ACTION_STOP)
+            runCatching { context.startService(intent) }
+        }
+    }
+}
+
+=== C:\Users\Msi\Desktop\flint\abujhan-container\app\src\main\java\com\abujhan\container\location\MockLocationStore.kt ===
+package com.abujhan.container.location
+
+import android.content.Context
+
+/** الموقع الوهمي النشط الذي يُطبَّق على النظام كله. */
+data class MockPoint(val lat: Double, val lng: Double, val accuracy: Float)
+
+object MockLocationStore {
+
+    private const val PREFS = "mock_location"
+
+    fun save(context: Context, point: MockPoint) {
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+            .putString("lat", point.lat.toString())
+            .putString("lng", point.lng.toString())
+            .putFloat("acc", point.accuracy)
+            .apply()
+    }
+
+    /** هل التزييف مفعّل من المستخدم؟ (يمنع إعادة التشغيل التلقائي بعد الإيقاف). */
+    fun isActive(context: Context): Boolean =
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getBoolean("active", false)
+
+    fun setActive(context: Context, active: Boolean) {
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+            .putBoolean("active", active)
+            .apply()
+    }
+
+    fun load(context: Context): MockPoint? {
+        val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val lat = prefs.getString("lat", null)?.toDoubleOrNull() ?: return null
+        val lng = prefs.getString("lng", null)?.toDoubleOrNull() ?: return null
+        return MockPoint(lat, lng, prefs.getFloat("acc", 5f))
+    }
+}
+
+=== C:\Users\Msi\Desktop\flint\abujhan-container\app\src\main\java\com\abujhan\container\ui\AppsAdapter.kt ===
+package com.abujhan.container.ui
+
+import android.view.LayoutInflater
+import android.view.ViewGroup
+import androidx.recyclerview.widget.RecyclerView
+import com.abujhan.container.R
+import com.abujhan.container.data.AppEntry
+import com.abujhan.container.databinding.ItemAppBinding
+
+class AppsAdapter(private val onClone: (AppEntry) -> Unit) :
+    RecyclerView.Adapter<AppsAdapter.ViewHolder>() {
+
+    private val items = ArrayList<AppEntry>()
+    private val busy = HashSet<String>()
+
+    fun submit(list: List<AppEntry>) {
+        items.clear()
+        items.addAll(list)
+        notifyDataSetChanged()
+    }
+
+    fun setBusy(packageName: String, value: Boolean) {
+        if (value) busy.add(packageName) else busy.remove(packageName)
+        val index = items.indexOfFirst { it.packageName == packageName }
+        if (index >= 0) notifyItemChanged(index)
+    }
+
+    override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): ViewHolder {
+        val binding = ItemAppBinding.inflate(LayoutInflater.from(parent.context), parent, false)
+        return ViewHolder(binding)
+    }
+
+    override fun getItemCount(): Int = items.size
+
+    override fun onBindViewHolder(holder: ViewHolder, position: Int) = holder.bind(items[position])
+
+    inner class ViewHolder(private val binding: ItemAppBinding) :
+        RecyclerView.ViewHolder(binding.root) {
+
+        fun bind(item: AppEntry) {
+            binding.appLabel.text = item.label
+            binding.appPackage.text = item.packageName
+            binding.appIcon.setImageDrawable(item.icon)
+            val isBusy = item.packageName in busy
+            binding.btnClone.isEnabled = !isBusy
+            binding.btnClone.setText(if (isBusy) R.string.cloning_btn else R.string.btn_clone)
+            binding.btnClone.setOnClickListener { onClone(item) }
+        }
+    }
+}
+
+=== C:\Users\Msi\Desktop\flint\abujhan-container\app\src\main\java\com\abujhan\container\ui\ContainersAdapter.kt ===
+package com.abujhan.container.ui
+
+import android.view.LayoutInflater
+import android.view.ViewGroup
+import androidx.recyclerview.widget.RecyclerView
+import com.abujhan.container.data.ContainerRecord
+import com.abujhan.container.databinding.ItemContainerBinding
+
+class ContainersAdapter(
+    private val onLaunch: (ContainerRecord) -> Unit,
+    private val onDelete: (ContainerRecord) -> Unit,
+    private val onSetLocation: (ContainerRecord) -> Unit,
+) : RecyclerView.Adapter<ContainersAdapter.ViewHolder>() {
+
+    private val items = ArrayList<ContainerRecord>()
+
+    fun submit(list: List<ContainerRecord>) {
+        items.clear()
+        items.addAll(list)
+        notifyDataSetChanged()
+    }
+
+    override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): ViewHolder {
+        val binding = ItemContainerBinding.inflate(LayoutInflater.from(parent.context), parent, false)
+        return ViewHolder(binding)
+    }
+
+    override fun getItemCount(): Int = items.size
+
+    override fun onBindViewHolder(holder: ViewHolder, position: Int) = holder.bind(items[position])
+
+    inner class ViewHolder(private val binding: ItemContainerBinding) :
+        RecyclerView.ViewHolder(binding.root) {
+
+        fun bind(item: ContainerRecord) {
+            binding.containerLabel.text = item.label
+            binding.containerPackage.text = item.containerPackage
+            binding.containerLocation.text = if (item.hasLocation) {
+                "الموقع: ${item.latitude}, ${item.longitude}"
+            } else {
+                "لا يوجد موقع محدّد"
+            }
+            binding.containerIcon.setImageResource(android.R.drawable.ic_menu_mylocation)
+            binding.btnContainerLaunch.setOnClickListener { onLaunch(item) }
+            binding.btnContainerDelete.setOnClickListener { onDelete(item) }
+            binding.btnContainerLocation.setOnClickListener { onSetLocation(item) }
+        }
+    }
+}
+
+=== C:\Users\Msi\Desktop\flint\abujhan-container\app\src\main\java\com\abujhan\container\ui\MapLayers.kt ===
+package com.abujhan.container.ui
+
+import org.osmdroid.tileprovider.tilesource.TileSourceFactory
+import org.osmdroid.tileprovider.tilesource.XYTileSource
+import org.osmdroid.util.MapTileIndex
+
+/** طبقات الخريطة: شوارع، قمر صناعي، تضاريس. كلها بدون مفتاح API. */
+object MapLayers {
+
+    private const val SATELLITE_URL =
+        "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/"
+
+    val STREET = TileSourceFactory.MAPNIK
+
+    /** صور الأقمار الصناعية من Esri (ترتيب الرابط z/y/x). */
+    val SATELLITE = object : XYTileSource(
+        "EsriWorldImagery", 0, 19, 256, ".jpg",
+        arrayOf(SATELLITE_URL),
+        "Esri, Maxar, Earthstar Geographics",
+    ) {
+        override fun getTileURLString(pMapTileIndex: Long): String {
+            val z = MapTileIndex.getZoom(pMapTileIndex)
+            val x = MapTileIndex.getX(pMapTileIndex)
+            val y = MapTileIndex.getY(pMapTileIndex)
+            return "$SATELLITE_URL$z/$y/$x"
+        }
+    }
+
+    val TERRAIN = XYTileSource(
+        "OpenTopoMap", 0, 17, 256, ".png",
+        arrayOf("https://tile.opentopomap.org/"),
+        "© OpenTopoMap",
+    )
+}
+
+=== C:\Users\Msi\Desktop\flint\abujhan-container\app\src\main\java\com\abujhan\container\ui\MapPickerActivity.kt ===
+package com.abujhan.container.ui
+
+import android.content.Intent
+import android.os.Bundle
+import androidx.appcompat.app.AppCompatActivity
+import com.abujhan.container.R
+import com.google.android.material.button.MaterialButton
+import org.osmdroid.config.Configuration
+import org.osmdroid.tileprovider.tilesource.TileSourceFactory
+import org.osmdroid.util.GeoPoint
+import org.osmdroid.views.MapView
+import org.osmdroid.views.overlay.MapEventsOverlay
+import org.osmdroid.views.overlay.Marker
+import org.osmdroid.events.MapEventsReceiver
+
+/**
+ * اختيار موقع من الخريطة: اضغط على نقطة لتحديدها ثم «تأكيد».
+ * يعيد خط العرض والطول عبر نتيجة Activity.
+ */
+class MapPickerActivity : AppCompatActivity() {
+
+    private lateinit var map: MapView
+    private var selected: GeoPoint? = null
+    private var marker: Marker? = null
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        Configuration.getInstance().userAgentValue = packageName
+        setContentView(R.layout.activity_map_picker)
+
+        map = findViewById(R.id.map)
+        map.setTileSource(TileSourceFactory.MAPNIK)
+        map.setMultiTouchControls(true)
+
+        val hasStart = intent.hasExtra(EXTRA_LAT) && intent.hasExtra(EXTRA_LNG)
+        val start = GeoPoint(
+            intent.getDoubleExtra(EXTRA_LAT, DEFAULT_LAT),
+            intent.getDoubleExtra(EXTRA_LNG, DEFAULT_LNG),
+        )
+        map.controller.setZoom(14.0)
+        map.controller.setCenter(start)
+        if (hasStart) setSelected(start)
+
+        map.overlays.add(
+            MapEventsOverlay(object : MapEventsReceiver {
+                override fun singleTapConfirmedHelper(p: GeoPoint): Boolean {
+                    setSelected(p)
+                    return true
+                }
+
+                override fun longPressHelper(p: GeoPoint): Boolean = false
+            })
+        )
+
+        findViewById<MaterialButton>(R.id.btnConfirmPoint).setOnClickListener {
+            val point = selected ?: return@setOnClickListener
+            setResult(
+                RESULT_OK,
+                Intent()
+                    .putExtra(EXTRA_LAT, point.latitude)
+                    .putExtra(EXTRA_LNG, point.longitude),
+            )
+            finish()
+        }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        map.onResume()
+    }
+
+    override fun onPause() {
+        super.onPause()
+        map.onPause()
+    }
+
+    private fun setSelected(point: GeoPoint) {
+        selected = point
+        marker?.let { map.overlays.remove(it) }
+        marker = Marker(map).apply {
+            position = point
+            setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_BOTTOM)
+        }
+        map.overlays.add(marker)
+        map.invalidate()
+    }
+
+    companion object {
+        const val EXTRA_LAT = "lat"
+        const val EXTRA_LNG = "lng"
+        private const val DEFAULT_LAT = 24.7136
+        private const val DEFAULT_LNG = 46.6753
+    }
+}
+
+=== C:\Users\Msi\Desktop\flint\abujhan-container\app\src\main\java\com\abujhan\container\App.kt ===
+package com.abujhan.container
+
+import android.app.Application
+
+/**
+ * التطبيق الرئيسي (الحاوية/المُستنسِخ).
+ * لا يوجد هنا أي منطق ترخيص — التطبيق يعمل محليًا بالكامل.
+ */
+class App : Application() {
+
+    override fun onCreate() {
+        super.onCreate()
+        instance = this
+    }
+
+    companion object {
+        lateinit var instance: App
+            private set
+    }
+}
+
+=== C:\Users\Msi\Desktop\flint\abujhan-container\app\src\main\java\com\abujhan\container\MainActivity.kt ===
+package com.abujhan.container
+
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.content.res.ColorStateList
+import android.graphics.Color
+import android.net.Uri
+import android.os.Bundle
+import java.io.File
+import android.text.Editable
+import android.text.InputType
+import android.text.TextWatcher
+import android.view.View
+import android.widget.EditText
+import android.widget.LinearLayout
+import android.widget.TextView
+import android.widget.Toast
+import androidx.appcompat.app.AlertDialog
+import androidx.appcompat.app.AppCompatActivity
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.content.ContextCompat
+import com.abujhan.container.ui.MapPickerActivity
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.lifecycleScope
+import androidx.lifecycle.repeatOnLifecycle
+import com.abujhan.container.databinding.DialogProgressBinding
+import androidx.recyclerview.widget.LinearLayoutManager
+import com.abujhan.container.clone.CloneEngine
+import com.abujhan.container.clone.CloneInstaller
+import com.abujhan.container.clone.CloneProgress
+import com.abujhan.container.clone.InstalledApps
+import com.abujhan.container.clone.RootHelper
+import com.abujhan.container.data.AppEntry
+import com.abujhan.container.data.ContainerRecord
+import com.abujhan.container.data.ContainerStore
+import com.abujhan.container.databinding.ActivityMainBinding
+import com.abujhan.container.location.Favorite
+import com.abujhan.container.location.FavoriteStore
+import com.abujhan.container.location.MockLocationService
+import com.abujhan.container.location.MockPoint
+import com.abujhan.container.location.MockLocationStore
+import com.abujhan.container.ui.AppsAdapter
+import com.abujhan.container.ui.ContainersAdapter
+import com.abujhan.container.ui.MapLayers
+import com.google.android.material.button.MaterialButtonToggleGroup
+import com.google.android.material.tabs.TabLayout
+import org.osmdroid.config.Configuration
+import org.osmdroid.util.GeoPoint
+import org.osmdroid.views.overlay.Marker
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+
+class MainActivity : AppCompatActivity() {
+
+    private lateinit var binding: ActivityMainBinding
+    private lateinit var store: ContainerStore
+    private val engine by lazy { CloneEngine(this) }
+
+    private var allApps: List<AppEntry> = emptyList()
+    private var rootAvailable = false
+
+    private val appsAdapter = AppsAdapter { entry -> cloneApp(entry) }
+    private val containersAdapter = ContainersAdapter(
+        onLaunch = { record -> launchContainer(record) },
+        onDelete = { record -> deleteContainer(record) },
+        onSetLocation = { record -> showLocationDialog(record) },
+    )
+
+    private var pickCallback: ((Double, Double) -> Unit)? = null
+    private var userMarker: Marker? = null
+    private var centeredOn: GeoPoint? = null
+
+    private val mapPicker = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult(),
+    ) { result ->
+        val data = result.data
+        if (result.resultCode == RESULT_OK && data != null) {
+            pickCallback?.invoke(
+                data.getDoubleExtra(MapPickerActivity.EXTRA_LAT, 0.0),
+                data.getDoubleExtra(MapPickerActivity.EXTRA_LNG, 0.0),
+            )
+        }
+        pickCallback = null
+    }
+
+    private fun openMapPicker(lat: Double?, lng: Double?, onPick: (Double, Double) -> Unit) {
+        pickCallback = onPick
+        val intent = Intent(this, MapPickerActivity::class.java)
+        if (lat != null && lng != null) {
+            intent.putExtra(MapPickerActivity.EXTRA_LAT, lat)
+            intent.putExtra(MapPickerActivity.EXTRA_LNG, lng)
+        }
+        mapPicker.launch(intent)
+    }
+
+    private val packageReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            val pkg = intent?.data?.schemeSpecificPart ?: return
+            val record = store.get(pkg) ?: return
+            if (intent.action == Intent.ACTION_PACKAGE_REMOVED) {
+                if (intent.getBooleanExtra(Intent.EXTRA_REPLACING, false)) return
+                deleteRecordFiles(record)
+                store.remove(pkg)
+                refreshContainers()
+                return
+            }
+            refreshContainers()
+            lifecycleScope.launch {
+                withContext(Dispatchers.IO) {
+                    RootHelper.hideRoot(pkg)
+                    RootHelper.grantLocationPermissions(pkg)
+                }
+            }
+        }
+    }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        Configuration.getInstance().userAgentValue = packageName
+        binding = ActivityMainBinding.inflate(layoutInflater)
+        setContentView(binding.root)
+        store = ContainerStore(this)
+
+        binding.miniMap.setMultiTouchControls(true)
+        binding.miniMap.controller.setZoom(15.0)
+        binding.miniMap.setOnTouchListener { view, _ ->
+            view.parent.requestDisallowInterceptTouchEvent(true)
+            false
+        }
+        binding.layerGroup.addOnButtonCheckedListener(
+            MaterialButtonToggleGroup.OnButtonCheckedListener { _, checkedId, isChecked ->
+                if (!isChecked) return@OnButtonCheckedListener
+                setLayer(
+                    when (checkedId) {
+                        R.id.btnLayerSatellite -> MapLayers.SATELLITE
+                        R.id.btnLayerTerrain -> MapLayers.TERRAIN
+                        else -> MapLayers.STREET
+                    },
+                )
+            },
+        )
+
+        binding.appsList.layoutManager = LinearLayoutManager(this)
+        binding.appsList.adapter = appsAdapter
+        binding.containersList.layoutManager = LinearLayoutManager(this)
+        binding.containersList.adapter = containersAdapter
+
+        binding.tabs.addOnTabSelectedListener(object : TabLayout.OnTabSelectedListener {
+            override fun onTabSelected(tab: TabLayout.Tab) = showPage(tab.position)
+            override fun onTabUnselected(tab: TabLayout.Tab) = Unit
+            override fun onTabReselected(tab: TabLayout.Tab) = Unit
+        })
+
+        binding.inputSearch.addTextChangedListener(object : TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) = Unit
+            override fun onTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) = applyFilter(s?.toString().orEmpty())
+            override fun afterTextChanged(s: Editable?) = Unit
+        })
+
+        binding.btnSaveLocation.setOnClickListener { saveDefaultLocation() }
+        binding.btnPickMap.setOnClickListener {
+            openMapPicker(
+                binding.inputLat.text?.toString()?.toDoubleOrNull(),
+                binding.inputLng.text?.toString()?.toDoubleOrNull(),
+            ) { lat, lng ->
+                binding.inputLat.setText(lat.toString())
+                binding.inputLng.setText(lng.toString())
+            }
+        }
+        binding.btnToggleLocation.setOnClickListener {
+            if (MockLocationStore.isActive(this)) stopLocation() else enableLocation()
+        }
+        binding.btnAddFavorite.setOnClickListener { addFavorite() }
+        binding.swipeApps.setOnRefreshListener { loadApps() }
+        binding.btnHideRoot.setOnClickListener { hideRootForContainers() }
+
+        loadDefaultLocation()
+        refreshFavorites()
+        showPage(0)
+        loadApps()
+        refreshContainers()
+        checkRoot()
+        lifecycleScope.launch {
+            repeatOnLifecycle(Lifecycle.State.STARTED) {
+                CloneProgress.state.collect { renderProgress(it) }
+            }
+        }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        binding.miniMap.onResume()
+        refreshStatus()
+        pruneDeletedContainers()
+    }
+
+    private var progressDialog: AlertDialog? = null
+    private var progressBinding: DialogProgressBinding? = null
+
+    /** يعرض نافذة التقدم أثناء النسخ والتثبيت، ويحدّثها حتى تكتمل العملية أو تفشل. */
+    private fun renderProgress(state: CloneProgress.State?) {
+        if (state == null) {
+            progressDialog?.dismiss()
+            progressDialog = null
+            progressBinding = null
+            return
+        }
+        val dialog = progressDialog ?: createProgressDialog().also { progressDialog = it }
+        val b = progressBinding ?: return
+        val finished = state.phase == CloneProgress.Phase.DONE || state.phase == CloneProgress.Phase.FAILED
+        dialog.setTitle(state.label)
+        b.progressText.text = when (state.phase) {
+            CloneProgress.Phase.CLONING -> getString(R.string.progress_cloning, state.label)
+            CloneProgress.Phase.INSTALLING -> getString(R.string.progress_installing, state.label)
+            CloneProgress.Phase.WAITING_CONFIRM -> getString(R.string.progress_waiting)
+            CloneProgress.Phase.DONE -> getString(R.string.progress_done, state.label)
+            CloneProgress.Phase.FAILED -> getString(R.string.progress_failed, state.message ?: "")
+        }
+        val indeterminate = state.percent < 0 && !finished
+        b.progressBar.isIndeterminate = indeterminate
+        if (!indeterminate) {
+            b.progressBar.progress = if (finished) 100 else state.percent
+        }
+        b.progressPercent.text = when {
+            indeterminate -> ""
+            finished -> ""
+            else -> "${b.progressBar.progress}%"
+        }
+        dialog.setCancelable(finished)
+        dialog.getButton(AlertDialog.BUTTON_POSITIVE)?.isEnabled = finished
+    }
+
+    private fun createProgressDialog(): AlertDialog {
+        val b = DialogProgressBinding.inflate(layoutInflater)
+        progressBinding = b
+        val dialog = AlertDialog.Builder(this)
+            .setView(b.root)
+            .setCancelable(false)
+            .setPositiveButton(R.string.btn_close) { _, _ -> CloneProgress.set(null) }
+            .create()
+        dialog.show()
+        dialog.getButton(AlertDialog.BUTTON_POSITIVE)?.isEnabled = false
+        return dialog
+    }
+
+    override fun onPause() {
+        super.onPause()
+        binding.miniMap.onPause()
+    }
+
+    override fun onStart() {
+        super.onStart()
+        val filter = IntentFilter().apply {
+            addAction(Intent.ACTION_PACKAGE_ADDED)
+            addAction(Intent.ACTION_PACKAGE_REMOVED)
+            addDataScheme("package")
+        }
+        ContextCompat.registerReceiver(this, packageReceiver, filter, ContextCompat.RECEIVER_NOT_EXPORTED)
+    }
+
+    override fun onStop() {
+        super.onStop()
+        runCatching { unregisterReceiver(packageReceiver) }
+    }
+
+    // ------------------------------------------------------------------- UI
+
+    private fun showPage(position: Int) {
+        binding.pageApps.visibility = if (position == 0) View.VISIBLE else View.GONE
+        binding.pageContainers.visibility = if (position == 1) View.VISIBLE else View.GONE
+        binding.pageLocation.visibility = if (position == 2) View.VISIBLE else View.GONE
+    }
+
+    private fun loadApps() {
+        binding.appsProgress.visibility = View.VISIBLE
+        lifecycleScope.launch {
+            allApps = withContext(Dispatchers.IO) { InstalledApps.load(this@MainActivity) }
+            applyFilter(binding.inputSearch.text?.toString().orEmpty())
+            binding.appsProgress.visibility = View.GONE
+            binding.swipeApps.isRefreshing = false
+        }
+    }
+
+    private fun applyFilter(query: String) {
+        val q = query.trim().lowercase()
+        val filtered = if (q.isEmpty()) allApps else allApps.filter {
+            it.label.lowercase().contains(q) || it.packageName.lowercase().contains(q)
+        }
+        appsAdapter.submit(filtered)
+    }
+
+    private fun refreshContainers() {
+        val list = store.all()
+        containersAdapter.submit(list)
+        binding.containersEmpty.visibility = if (list.isEmpty()) View.VISIBLE else View.GONE
+    }
+
+    // ---------------------------------------------------------------- root
+
+    private fun checkRoot() {
+        lifecycleScope.launch {
+            rootAvailable = withContext(Dispatchers.IO) { RootHelper.hasRoot() }
+            binding.textRootStatus.text = getString(
+                if (rootAvailable) R.string.root_available else R.string.root_missing,
+            )
+        }
+    }
+
+    /**
+     * يفعّل الموقع الوهمي من داخل ABUJHAN نفسه: يمنح الصلاحية عبر root
+     * (بدون أي خطوة في خيارات المطوّر) ثم يشغّل الخدمة بالموقع المحفوظ.
+     */
+    private fun enableLocation() {
+        val point = currentPoint() ?: run {
+            toast("أدخل إحداثيات صالحة أولًا")
+            return
+        }
+        lifecycleScope.launch {
+            val rooted = withContext(Dispatchers.IO) { RootHelper.hasRoot() }
+            if (!rooted) {
+                // بدون روت: النسخ المستنسخة تقرأ الموقع من ABUJHAN مباشرة، فيكفي حفظ الحالة.
+                MockLocationStore.save(this@MainActivity, point)
+                MockLocationStore.setActive(this@MainActivity, true)
+                toast("مفعّل للنسخ فقط، الجهاز بدون روت")
+                refreshStatus()
+                return@launch
+            }
+            val granted = withContext(Dispatchers.IO) {
+                val ok = RootHelper.grantMockLocation(packageName)
+                RootHelper.grantLocationPermissions(packageName)
+                ok
+            }
+            if (!granted) {
+                toast("تعذّر منح صلاحية الموقع الوهمي، تأكد من منح ABUJHAN صلاحية root")
+                return@launch
+            }
+            MockLocationService.activate(this@MainActivity, point)
+            toast(getString(R.string.mock_enabled_self))
+            refreshStatus()
+        }
+    }
+
+    /** يوقف الموقع الوهمي: يزيل مزوّدات الاختبار ويسحب الصلاحية ليعود الموقع الحقيقي. */
+    private fun stopLocation() {
+        MockLocationService.deactivate(this)
+        refreshStatus()
+        lifecycleScope.launch {
+            withContext(Dispatchers.IO) { RootHelper.revokeMockLocation(packageName) }
+            toast("تم إيقاف الموقع الوهمي")
+        }
+    }
+
+    private fun setLayer(source: org.osmdroid.tileprovider.tilesource.ITileSource) {
+        binding.miniMap.setTileSource(source)
+    }
+
+    /** يحدّث زر التفعيل: أخضر والموقع مفعّل، أحمر والموقع متوقف. */
+    private fun updateToggle(active: Boolean) {
+        binding.btnToggleLocation.setText(if (active) R.string.btn_toggle_off else R.string.btn_toggle_on)
+        binding.btnToggleLocation.backgroundTintList =
+            ColorStateList.valueOf(Color.parseColor(if (active) "#2E7D32" else "#C62828"))
+        binding.btnToggleLocation.setTextColor(Color.WHITE)
+    }
+
+    /**
+     * يضع دبوس «موقعي» في الخريطة المصغّرة: عند الموقع الوهمي يكون في الموقع الوهمي،
+     * وإلا في الموقع الحقيقي الذي قرأناه آخر مرة.
+     */
+    private fun updateMiniMap(pin: GeoPoint?) {
+        val map = binding.miniMap
+        userMarker?.let { map.overlays.remove(it) }
+        userMarker = null
+        if (pin == null) {
+            map.invalidate()
+            return
+        }
+        userMarker = Marker(map).apply {
+            position = pin
+            title = getString(R.string.my_pin)
+            setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_BOTTOM)
+        }
+        map.overlays.add(userMarker)
+        if (centeredOn != pin) {
+            map.controller.animateTo(pin)
+            centeredOn = pin
+        }
+        map.invalidate()
+    }
+
+    private fun realPin(): GeoPoint? {
+        val prefs = getSharedPreferences("real_location", MODE_PRIVATE)
+        val lat = prefs.getString("lat", null)?.toDoubleOrNull() ?: return null
+        val lng = prefs.getString("lng", null)?.toDoubleOrNull() ?: return null
+        return GeoPoint(lat, lng)
+    }
+
+    private fun saveRealPin(lat: Double, lng: Double) {
+        getSharedPreferences("real_location", MODE_PRIVATE).edit()
+            .putString("lat", lat.toString())
+            .putString("lng", lng.toString())
+            .apply()
+    }
+
+    // ------------------------------------------------------------- favorites
+
+    private fun addFavorite() {
+        val lat = binding.inputLat.text?.toString()?.toDoubleOrNull()
+        val lng = binding.inputLng.text?.toString()?.toDoubleOrNull()
+        if (lat == null || lng == null) {
+            toast("إحداثيات غير صالحة")
+            return
+        }
+        val acc = binding.inputAccuracy.text?.toString()?.toFloatOrNull() ?: 5f
+        val nameInput = EditText(this).apply { hint = getString(R.string.favorite_name_hint) }
+        AlertDialog.Builder(this)
+            .setView(nameInput.apply { setPadding(48, 24, 48, 24) })
+            .setPositiveButton(R.string.btn_add_favorite) { _, _ ->
+                val name = nameInput.text.toString().trim().ifEmpty { "$lat, $lng" }
+                FavoriteStore.add(this, Favorite(name, lat, lng, acc))
+                refreshFavorites()
+                toast(getString(R.string.favorite_added))
+            }
+            .setNegativeButton(android.R.string.cancel, null)
+            .show()
+    }
+
+    /** يبني قائمة المفضلة: اضغط لتحميل الموقع في الحقول، واضغط مطولًا للحذف. */
+    private fun refreshFavorites() {
+        val list = binding.favoritesList
+        list.removeAllViews()
+        val favorites = FavoriteStore.all(this)
+        if (favorites.isEmpty()) {
+            list.addView(TextView(this).apply {
+                setText(R.string.favorites_empty)
+                setTextColor(getColor(R.color.muted))
+                setPadding(8, 8, 8, 8)
+            })
+            return
+        }
+        favorites.forEachIndexed { index, fav ->
+            list.addView(TextView(this).apply {
+                text = "${fav.name}\n${fav.lat}, ${fav.lng}"
+                textSize = 14f
+                setPadding(16, 16, 16, 16)
+                setBackgroundColor(0x22000000)
+                setOnClickListener {
+                    binding.inputLat.setText(fav.lat.toString())
+                    binding.inputLng.setText(fav.lng.toString())
+                    binding.inputAccuracy.setText(fav.accuracy.toString())
+                    toast(getString(R.string.location_saved))
+                }
+                setOnLongClickListener {
+                    AlertDialog.Builder(this@MainActivity)
+                        .setTitle(R.string.favorite_delete_title)
+                        .setPositiveButton(R.string.btn_delete) { _, _ ->
+                            FavoriteStore.remove(this@MainActivity, index)
+                            refreshFavorites()
+                        }
+                        .setNegativeButton(android.R.string.cancel, null)
+                        .show()
+                    true
+                }
+                val lp = LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                ).apply { topMargin = 8 }
+                layoutParams = lp
+            })
+        }
+    }
+
+    /** الإحداثيات المعروضة في تبويب الموقع، أو المحفوظة إن لم تكن مدخلة. */
+    private fun currentPoint(): MockPoint? {
+        val lat = binding.inputLat.text?.toString()?.toDoubleOrNull()
+        val lng = binding.inputLng.text?.toString()?.toDoubleOrNull()
+        if (lat != null && lng != null) {
+            val acc = binding.inputAccuracy.text?.toString()?.toFloatOrNull() ?: 5f
+            return MockPoint(lat, lng, acc)
+        }
+        return MockLocationStore.load(this)
+    }
+
+    /** يخفي الروت عن كل النسخ فقط؛ الموقع الوهمي يأتي من ABUJHAN. */
+    private fun hideRootForContainers() {
+        val containers = store.all()
+        lifecycleScope.launch {
+            withContext(Dispatchers.IO) {
+                containers.forEach { RootHelper.hideRoot(it.containerPackage) }
+            }
+            toast(getString(R.string.root_applied))
+        }
+    }
+
+    // --------------------------------------------------------------- cloning
+
+    private fun cloneApp(entry: AppEntry) {
+        toast(getString(R.string.cloning))
+        appsAdapter.setBusy(entry.packageName, true)
+        CloneProgress.set(CloneProgress.State(entry.label, CloneProgress.Phase.CLONING))
+        lifecycleScope.launch {
+            try {
+                val newPackage = engine.nextContainerPackage(entry.packageName)
+                val output = withContext(Dispatchers.IO) { engine.build(entry, newPackage) }
+                store.upsert(
+                    ContainerRecord(
+                        originalPackage = entry.packageName,
+                        containerPackage = newPackage,
+                        label = entry.label,
+                        apkPaths = output.all.map { it.absolutePath },
+                    )
+                )
+                refreshContainers()
+                withContext(Dispatchers.IO) {
+                    CloneInstaller.install(this@MainActivity, output.all, entry.label)
+                }
+            } catch (t: Throwable) {
+                CloneProgress.set(
+                    CloneProgress.State(
+                        entry.label,
+                        CloneProgress.Phase.FAILED,
+                        message = t.message ?: t.javaClass.simpleName,
+                    ),
+                )
+                toast(getString(R.string.clone_failed, t.message ?: t.javaClass.simpleName))
+            } finally {
+                appsAdapter.setBusy(entry.packageName, false)
+            }
+        }
+    }
+
+    /** يحذف ملفات APK للنسخة من مساحة التطبيق. */
+    private fun deleteRecordFiles(record: ContainerRecord) {
+        record.apkPaths.forEach { path -> runCatching { File(path).delete() } }
+    }
+
+    /**
+     * يحذف السجلات التي طُلب حذفها بعد أن يتأكد النظام من إزالة النسخة.
+     * إن بقيت النسخة مثبّتة (أُلغي الحذف) نزيل علامة الحذف فقط.
+     */
+    private fun pruneDeletedContainers() {
+        store.all().filter { it.pendingDelete }.forEach { record ->
+            if (CloneInstaller.isInstalled(this, record.containerPackage)) {
+                store.setPendingDelete(record.containerPackage, false)
+            } else {
+                deleteRecordFiles(record)
+                store.remove(record.containerPackage)
+            }
+        }
+        refreshContainers()
+    }
+
+    private fun launchContainer(record: ContainerRecord) {
+        if (!CloneInstaller.isInstalled(this, record.containerPackage)) {
+            toast("النسخة غير مثبّتة على الجهاز")
+            return
+        }
+        lifecycleScope.launch {
+            withContext(Dispatchers.IO) {
+                RootHelper.forceStop(record.containerPackage)
+                RootHelper.hideRoot(record.containerPackage)
+                RootHelper.grantLocationPermissions(record.containerPackage)
+                RootHelper.grantMockLocation(packageName)
+            }
+            // الموقع الوهمي للنظام كله: نفعّل الموقع المحدّد للحاوية كموقع نشط.
+            if (record.hasLocation) {
+                MockLocationService.activate(
+                    this@MainActivity,
+                    MockPoint(record.latitude!!, record.longitude!!, record.accuracy),
+                )
+            }
+            val launched = CloneInstaller.launch(this@MainActivity, record.containerPackage)
+            if (!launched) toast("تعذّر تشغيل النسخة")
+        }
+    }
+
+    /**
+     * يلغي تثبيت النسخة من الجهاز كاملة، ثم يحذف سجلها وملفاتها بعد التأكد من الإزالة.
+     * على الجهاز المروّت تُلغى مباشرة، وإلا يفتح النظام نافذة الحذف.
+     */
+    private fun deleteContainer(record: ContainerRecord) {
+        store.setPendingDelete(record.containerPackage, true)
+        refreshContainers()
+        lifecycleScope.launch {
+            if (!CloneInstaller.isInstalled(this@MainActivity, record.containerPackage)) {
+                pruneDeletedContainers()
+                return@launch
+            }
+            val removed = withContext(Dispatchers.IO) {
+                rootAvailable && RootHelper.uninstallPackage(record.containerPackage)
+            }
+            if (removed) {
+                pruneDeletedContainers()
+            } else {
+                startActivity(Intent(Intent.ACTION_DELETE, Uri.parse("package:${record.containerPackage}")))
+            }
+        }
+    }
+
+    // -------------------------------------------------------------- location
+
+    private fun showLocationDialog(record: ContainerRecord) {
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(48, 24, 48, 0)
+        }
+        val latInput = numberField("خط العرض", record.latitude?.toString() ?: "")
+        val lngInput = numberField("خط الطول", record.longitude?.toString() ?: "")
+        val accInput = numberField("الدقة (متر)", record.accuracy.toString())
+        container.addView(android.widget.Button(this).apply {
+            text = getString(R.string.btn_pick_map)
+            setOnClickListener {
+                openMapPicker(
+                    latInput.text.toString().toDoubleOrNull(),
+                    lngInput.text.toString().toDoubleOrNull(),
+                ) { lat, lng ->
+                    latInput.setText(lat.toString())
+                    lngInput.setText(lng.toString())
+                }
+            }
+        })
+        container.addView(latInput)
+        container.addView(lngInput)
+        container.addView(accInput)
+
+        AlertDialog.Builder(this)
+            .setTitle(record.label)
+            .setView(container)
+            .setPositiveButton(R.string.location_save) { _, _ ->
+                val lat = latInput.text.toString().toDoubleOrNull()
+                val lng = lngInput.text.toString().toDoubleOrNull()
+                if (lat == null || lng == null) {
+                    toast("إحداثيات غير صالحة")
+                    return@setPositiveButton
+                }
+                record.latitude = lat
+                record.longitude = lng
+                record.accuracy = accInput.text.toString().toFloatOrNull() ?: 5f
+                store.upsert(record)
+                refreshContainers()
+                toast(getString(R.string.location_saved))
+            }
+            .setNegativeButton(android.R.string.cancel, null)
+            .show()
+    }
+
+    private fun numberField(hint: String, value: String): EditText = EditText(this).apply {
+        this.hint = hint
+        inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL or
+            InputType.TYPE_NUMBER_FLAG_SIGNED
+        setText(value)
+    }
+
+    private fun saveDefaultLocation() {
+        getSharedPreferences("defaults", MODE_PRIVATE).edit()
+            .putString("lat", binding.inputLat.text.toString())
+            .putString("lng", binding.inputLng.text.toString())
+            .putString("accuracy", binding.inputAccuracy.text.toString())
+            .apply()
+        val lat = binding.inputLat.text.toString().toDoubleOrNull()
+        val lng = binding.inputLng.text.toString().toDoubleOrNull()
+        if (lat == null || lng == null) {
+            toast("إحداثيات غير صالحة")
+            return
+        }
+        toast(getString(R.string.location_saved))
+    }
+
+    /** حالة الموقع الوهمي: التفعيل، صلاحية النظام، وما يعرضه النظام فعلًا الآن. */
+    private fun refreshStatus() {
+        val active = MockLocationStore.isActive(this)
+        val point = MockLocationStore.load(this)
+        val permitted = isMockPermitted()
+        val lm = getSystemService(LOCATION_SERVICE) as? android.location.LocationManager
+        val systemLocation = runCatching {
+            lm?.getLastKnownLocation(android.location.LocationManager.GPS_PROVIDER)
+                ?: lm?.getLastKnownLocation(android.location.LocationManager.NETWORK_PROVIDER)
+        }.getOrNull()
+        val systemMock = systemLocation?.let {
+            if (android.os.Build.VERSION.SDK_INT >= 31) it.isMock else @Suppress("DEPRECATION") it.isFromMockProvider
+        } == true
+        if (systemLocation != null && !systemMock) saveRealPin(systemLocation.latitude, systemLocation.longitude)
+        updateToggle(active)
+        updateMiniMap(
+            if (active && point != null) GeoPoint(point.lat, point.lng) else realPin(),
+        )
+
+        val lines = listOf(
+            "الموقع الوهمي: " + if (active) "مفعّل" else "متوقف",
+            "صلاحية ABUJHAN كمصدر وهمي: " + if (permitted) "ممنوحة" else "غير ممنوحة",
+            "الموقع المحفوظ: " + (point?.let { "${it.lat}, ${it.lng}" } ?: "لا يوجد"),
+            "الموقع الذي يعرضه النظام الآن: " +
+                (systemLocation?.let { "${it.latitude}, ${it.longitude}" } ?: "غير متاح") +
+                if (systemMock) " (وهمي ✔)" else " (حقيقي)",
+        )
+        binding.textLocationStatus.text = lines.joinToString("\n")
+    }
+
+    private fun isMockPermitted(): Boolean {
+        val appOps = getSystemService(APP_OPS_SERVICE) as? android.app.AppOpsManager ?: return false
+        @Suppress("DEPRECATION")
+        val mode = appOps.checkOpNoThrow(
+            android.app.AppOpsManager.OPSTR_MOCK_LOCATION,
+            android.os.Process.myUid(),
+            packageName,
+        )
+        return mode == android.app.AppOpsManager.MODE_ALLOWED
+    }
+
+    private fun loadDefaultLocation() {
+        val prefs = getSharedPreferences("defaults", MODE_PRIVATE)
+        binding.inputLat.setText(prefs.getString("lat", ""))
+        binding.inputLng.setText(prefs.getString("lng", ""))
+        binding.inputAccuracy.setText(prefs.getString("accuracy", "5"))
+    }
+
+    private fun toast(message: String) {
+        Toast.makeText(this, message, Toast.LENGTH_SHORT).show()
+    }
+}
+
+=== C:\Users\Msi\Desktop\flint\abujhan-container\app\src\main\res\drawable\ic_launcher.xml ===
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path
+        android:fillColor="#14503F"
+        android:pathData="M0,0h108v108h-108z" />
+    <path
+        android:fillColor="#62D6A8"
+        android:pathData="M54,20c-11,0 -20,9 -20,20c0,15 20,38 20,38s20,-23 20,-38C74,29 65,20 54,20zM54,46c-3.3,0 -6,-2.7 -6,-6s2.7,-6 6,-6s6,2.7 6,6S57.3,46 54,46z" />
+</vector>
+
+=== C:\Users\Msi\Desktop\flint\abujhan-container\app\src\main\res\layout\activity_main.xml ===
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical">
+
+    <com.google.android.material.appbar.MaterialToolbar
+        android:id="@+id/toolbar"
+        android:layout_width="match_parent"
+        android:layout_height="?attr/actionBarSize"
+        android:background="@color/primary"
+        app:title="@string/app_name"
+        app:titleTextColor="#FFFFFFFF" />
+
+    <com.google.android.material.tabs.TabLayout
+        android:id="@+id/tabs"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        app:tabMode="fixed">
+
+        <com.google.android.material.tabs.TabItem
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="@string/tab_apps" />
+
+        <com.google.android.material.tabs.TabItem
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="@string/tab_containers" />
+
+        <com.google.android.material.tabs.TabItem
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="@string/tab_location" />
+    </com.google.android.material.tabs.TabLayout>
+
+    <FrameLayout
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1">
+
+        <!-- ================= صفحة التطبيقات ================= -->
+        <LinearLayout
+            android:id="@+id/pageApps"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:orientation="vertical">
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:padding="12dp"
+                android:text="@string/apps_hint"
+                android:textColor="@color/muted" />
+
+            <com.google.android.material.textfield.TextInputLayout
+                style="@style/Widget.Material3.TextInputLayout.OutlinedBox"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginHorizontal="16dp"
+                android:layout_marginBottom="8dp"
+                android:hint="@string/search_hint">
+
+                <com.google.android.material.textfield.TextInputEditText
+                    android:id="@+id/inputSearch"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:imeOptions="actionSearch"
+                    android:inputType="text" />
+            </com.google.android.material.textfield.TextInputLayout>
+
+            <androidx.swiperefreshlayout.widget.SwipeRefreshLayout
+                android:id="@+id/swipeApps"
+                android:layout_width="match_parent"
+                android:layout_height="0dp"
+                android:layout_weight="1">
+
+                <FrameLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="match_parent">
+
+                    <androidx.recyclerview.widget.RecyclerView
+                        android:id="@+id/appsList"
+                        android:layout_width="match_parent"
+                        android:layout_height="match_parent"
+                        android:clipToPadding="false"
+                        android:paddingBottom="12dp" />
+
+                    <ProgressBar
+                        android:id="@+id/appsProgress"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:layout_gravity="center" />
+                </FrameLayout>
+            </androidx.swiperefreshlayout.widget.SwipeRefreshLayout>
+        </LinearLayout>
+
+        <!-- ================= صفحة الحاويات ================= -->
+        <LinearLayout
+            android:id="@+id/pageContainers"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:orientation="vertical"
+            android:visibility="gone">
+
+            <FrameLayout
+                android:layout_width="match_parent"
+                android:layout_height="match_parent">
+
+                <androidx.recyclerview.widget.RecyclerView
+                    android:id="@+id/containersList"
+                    android:layout_width="match_parent"
+                    android:layout_height="match_parent"
+                    android:clipToPadding="false"
+                    android:paddingBottom="12dp" />
+
+                <TextView
+                    android:id="@+id/containersEmpty"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_gravity="center"
+                    android:text="@string/containers_empty"
+                    android:textColor="@color/muted"
+                    android:visibility="gone" />
+            </FrameLayout>
+        </LinearLayout>
+
+        <!-- ================= صفحة الموقع ================= -->
+        <ScrollView
+            android:id="@+id/pageLocation"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:visibility="gone">
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical"
+                android:padding="16dp">
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="@string/location_title"
+                    android:textSize="20sp"
+                    android:textStyle="bold" />
+
+                <TextView
+                    android:id="@+id/textLocationStatus"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="12dp"
+                    android:padding="12dp"
+                    android:background="#22000000"
+                    android:textSize="14sp"
+                    android:text="..." />
+
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/btnToggleLocation"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="12dp"
+                    android:minHeight="56dp"
+                    android:text="@string/btn_toggle_on" />
+
+                <com.google.android.material.button.MaterialButtonToggleGroup
+                    android:id="@+id/layerGroup"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="16dp"
+                    app:checkedButton="@+id/btnLayerMap"
+                    app:selectionRequired="true"
+                    app:singleSelection="true">
+
+                    <com.google.android.material.button.MaterialButton
+                        android:id="@+id/btnLayerMap"
+                        style="@style/Widget.Material3.Button.OutlinedButton"
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:text="@string/layer_map" />
+
+                    <com.google.android.material.button.MaterialButton
+                        android:id="@+id/btnLayerSatellite"
+                        style="@style/Widget.Material3.Button.OutlinedButton"
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:text="@string/layer_satellite" />
+
+                    <com.google.android.material.button.MaterialButton
+                        android:id="@+id/btnLayerTerrain"
+                        style="@style/Widget.Material3.Button.OutlinedButton"
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:text="@string/layer_terrain" />
+                </com.google.android.material.button.MaterialButtonToggleGroup>
+
+                <org.osmdroid.views.MapView
+                    android:id="@+id/miniMap"
+                    android:layout_width="match_parent"
+                    android:layout_height="240dp"
+                    android:layout_marginTop="8dp" />
+
+                <com.google.android.material.textfield.TextInputLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="16dp"
+                    android:hint="@string/location_lat">
+
+                    <com.google.android.material.textfield.TextInputEditText
+                        android:id="@+id/inputLat"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:inputType="numberDecimal|numberSigned" />
+                </com.google.android.material.textfield.TextInputLayout>
+
+                <com.google.android.material.textfield.TextInputLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="12dp"
+                    android:hint="@string/location_lng">
+
+                    <com.google.android.material.textfield.TextInputEditText
+                        android:id="@+id/inputLng"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:inputType="numberDecimal|numberSigned" />
+                </com.google.android.material.textfield.TextInputLayout>
+
+                <com.google.android.material.textfield.TextInputLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="12dp"
+                    android:hint="@string/location_accuracy">
+
+                    <com.google.android.material.textfield.TextInputEditText
+                        android:id="@+id/inputAccuracy"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:inputType="numberDecimal" />
+                </com.google.android.material.textfield.TextInputLayout>
+
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="12dp"
+                    android:orientation="horizontal">
+
+                    <com.google.android.material.button.MaterialButton
+                        android:id="@+id/btnPickMap"
+                        style="@style/Widget.Material3.Button.TonalButton"
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:text="@string/btn_pick_map" />
+
+                    <com.google.android.material.button.MaterialButton
+                        android:id="@+id/btnSaveLocation"
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_marginStart="8dp"
+                        android:layout_weight="1"
+                        android:text="@string/location_save" />
+                </LinearLayout>
+
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/btnAddFavorite"
+                    style="@style/Widget.Material3.Button.TonalButton"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="8dp"
+                    android:text="@string/btn_add_favorite" />
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="20dp"
+                    android:text="@string/favorites_title"
+                    android:textSize="16sp"
+                    android:textStyle="bold" />
+
+                <LinearLayout
+                    android:id="@+id/favoritesList"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="8dp"
+                    android:orientation="vertical" />
+
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/btnHideRoot"
+                    style="@style/Widget.Material3.Button.TonalButton"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="20dp"
+                    android:text="@string/btn_hide_root" />
+
+                <TextView
+                    android:id="@+id/textRootStatus"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="8dp"
+                    android:textColor="@color/muted"
+                    android:textSize="13sp" />
+
+                <TextView
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="16dp"
+                    android:text="@string/location_note"
+                    android:textColor="@color/muted" />
+            </LinearLayout>
+        </ScrollView>
+    </FrameLayout>
+</LinearLayout>
+
+=== C:\Users\Msi\Desktop\flint\abujhan-container\app\src\main\res\layout\activity_map_picker.xml ===
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical">
+
+    <org.osmdroid.views.MapView
+        android:id="@+id/map"
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1" />
+
+    <com.google.android.material.button.MaterialButton
+        android:id="@+id/btnConfirmPoint"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_margin="12dp"
+        android:text="@string/map_confirm"
+        android:textColor="#FFFFFFFF" />
+</LinearLayout>
+
+=== C:\Users\Msi\Desktop\flint\abujhan-container\app\src\main\res\layout\dialog_progress.xml ===
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:orientation="vertical"
+    android:padding="24dp">
+
+    <TextView
+        android:id="@+id/progressText"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:textSize="16sp" />
+
+    <ProgressBar
+        android:id="@+id/progressBar"
+        style="?android:attr/progressBarStyleHorizontal"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="16dp" />
+
+    <TextView
+        android:id="@+id/progressPercent"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="8dp"
+        android:gravity="center"
+        android:textColor="@color/muted"
+        android:textSize="13sp" />
+</LinearLayout>
+
+=== C:\Users\Msi\Desktop\flint\abujhan-container\app\src\main\res\layout\item_app.xml ===
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:gravity="center_vertical"
+    android:orientation="horizontal"
+    android:paddingHorizontal="16dp"
+    android:paddingVertical="10dp">
+
+    <ImageView
+        android:id="@+id/appIcon"
+        android:layout_width="44dp"
+        android:layout_height="44dp"
+        android:contentDescription="@null" />
+
+    <LinearLayout
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:layout_marginStart="12dp"
+        android:layout_weight="1"
+        android:orientation="vertical">
+
+        <TextView
+            android:id="@+id/appLabel"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:maxLines="1"
+            android:ellipsize="end"
+            android:textSize="16sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:id="@+id/appPackage"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:maxLines="1"
+            android:ellipsize="end"
+            android:textColor="@color/muted"
+            android:textSize="12sp" />
+    </LinearLayout>
+
+    <com.google.android.material.button.MaterialButton
+        android:id="@+id/btnClone"
+        style="@style/Widget.Material3.Button.TonalButton"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="@string/btn_clone" />
+</LinearLayout>
+
+=== C:\Users\Msi\Desktop\flint\abujhan-container\app\src\main\res\layout\item_container.xml ===
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:orientation="vertical"
+    android:paddingHorizontal="16dp"
+    android:paddingVertical="10dp">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:gravity="center_vertical"
+        android:orientation="horizontal">
+
+        <ImageView
+            android:id="@+id/containerIcon"
+            android:layout_width="44dp"
+            android:layout_height="44dp"
+            android:contentDescription="@null" />
+
+        <LinearLayout
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="12dp"
+            android:layout_weight="1"
+            android:orientation="vertical">
+
+            <TextView
+                android:id="@+id/containerLabel"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:maxLines="1"
+                android:ellipsize="end"
+                android:textSize="16sp"
+                android:textStyle="bold" />
+
+            <TextView
+                android:id="@+id/containerPackage"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:maxLines="1"
+                android:ellipsize="end"
+                android:textColor="@color/muted"
+                android:textSize="12sp" />
+
+            <TextView
+                android:id="@+id/containerLocation"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:maxLines="1"
+                android:ellipsize="end"
+                android:textColor="@color/accent"
+                android:textSize="12sp" />
+        </LinearLayout>
+    </LinearLayout>
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="6dp"
+        android:gravity="end"
+        android:orientation="horizontal">
+
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/btnContainerLocation"
+            style="@style/Widget.Material3.Button.TextButton"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="@string/btn_set_location" />
+
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/btnContainerLaunch"
+            style="@style/Widget.Material3.Button.TextButton"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="@string/btn_launch" />
+
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/btnContainerDelete"
+            style="@style/Widget.Material3.Button.TextButton"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="@string/btn_delete" />
+    </LinearLayout>
+</LinearLayout>
+
+=== C:\Users\Msi\Desktop\flint\abujhan-container\app\src\main\res\values\colors.xml ===
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="primary">#FF1E6F5C</color>
+    <color name="primary_dark">#FF14503F</color>
+    <color name="accent">#FF62D6A8</color>
+    <color name="surface">#FF101418</color>
+    <color name="on_surface">#FFE6EAEA</color>
+    <color name="muted">#FF9AA5A0</color>
+</resources>
+
+=== C:\Users\Msi\Desktop\flint\abujhan-container\app\src\main\res\values\strings.xml ===
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">ABUJHAN</string>
+
+    <string name="tab_apps">التطبيقات</string>
+    <string name="tab_containers">المستودعات</string>
+    <string name="tab_location">الموقع</string>
+
+    <string name="apps_hint">اختر تطبيقًا لإنشاء نسخة (مستودع) منه</string>
+    <string name="search_hint">ابحث عن تطبيق…</string>
+    <string name="btn_pick_map">اختيار من الخريطة</string>
+    <string name="mock_running">الموقع الوهمي يعمل لكل التطبيقات</string>
+    <string name="mock_enabled_self">تم تفعيل ABUJHAN كمصدر موقع وهمي للنظام</string>
+    <string name="map_confirm">تأكيد الموقع المحدّد</string>
+    <string name="btn_clone">استنساخ</string>
+    <string name="btn_launch">تشغيل</string>
+    <string name="btn_delete">حذف</string>
+    <string name="btn_set_location">تحديد الموقع</string>
+    <string name="btn_install_location">تثبيت تطبيق الموقع الوهمي</string>
+    <string name="btn_grant_root">تفعيل ABUJHAN كمصدر الموقع الوهمي (root)</string>
+    <string name="btn_hide_root">إخفاء الروت عن المستودعات</string>
+    <string name="btn_stop_location">إيقاف الموقع الوهمي</string>
+    <string name="btn_dev_options">فتح خيارات المطوّر</string>
+    <string name="root_available">root متاح ✔ — سيُمنح الموقع الوهمي تلقائيًا.</string>
+    <string name="root_missing">root غير متاح — التزييف يعمل داخل النسخ المستنسخة فقط.</string>
+    <string name="split_warning">هذا التطبيق مقسّم إلى عدّة ملفات؛ ستُثبَّت جميع الأجزاء.</string>
+
+    <string name="containers_empty">لا توجد مستودعات بعد</string>
+    <string name="apps_loading">جارٍ تحميل التطبيقات…</string>
+
+    <string name="location_title">الموقع الوهمي</string>
+    <string name="location_lat">خط العرض (Latitude)</string>
+    <string name="location_lng">خط الطول (Longitude)</string>
+    <string name="location_accuracy">الدقة (متر)</string>
+    <string name="location_save">حفظ الموقع</string>
+    <string name="location_note">يعمل الموقع الوهمي داخل النسخ المستنسخة على كل الأجهزة. على الأجهزة المروّتة يُفعَّل أيضًا لكل النظام تلقائيًا.</string>
+    <string name="location_saved">تم حفظ الموقع</string>
+
+    <string name="cloning">جارٍ بناء المستودع…</string>
+    <string name="clone_done">تم بناء المستودع، أكمل التثبيت من المثبّت</string>
+    <string name="clone_failed">فشل بناء المستودع: %1$s</string>
+    <string name="install_started">جارٍ فتح مثبّت النظام…</string>
+    <string name="root_applied">تم تفعيل صلاحية الموقع الوهمي</string>
+
+    <string name="btn_toggle_on">الموقع الوهمي متوقف، اضغط للتفعيل</string>
+    <string name="btn_toggle_off">الموقع الوهمي مفعّل، اضغط للإيقاف</string>
+    <string name="cloning_btn">جارٍ الاستنساخ</string>
+    <string name="layer_map">خريطة</string>
+    <string name="layer_satellite">قمر صناعي</string>
+    <string name="layer_terrain">تضاريس</string>
+    <string name="my_pin">موقعي</string>
+    <string name="btn_add_favorite">حفظ الموقع الحالي في المفضلة</string>
+    <string name="favorites_title">المفضلة</string>
+    <string name="favorites_empty">لا توجد مواقع محفوظة</string>
+    <string name="favorite_name_hint">اسم الموقع</string>
+    <string name="favorite_added">تمت الإضافة إلى المفضلة</string>
+    <string name="favorite_delete_title">حذف الموقع من المفضلة؟</string>
+
+    <string name="btn_close">إغلاق</string>
+    <string name="progress_cloning">جارٍ نسخ %1$s</string>
+    <string name="progress_installing">جارٍ تثبيت %1$s</string>
+    <string name="progress_waiting">بانتظار تأكيد التثبيت من النظام</string>
+    <string name="progress_done">تم تثبيت %1$s</string>
+    <string name="progress_failed">فشلت العملية: %1$s</string>
+</resources>
+
+
+=== C:\Users\Msi\Desktop\flint\abujhan-container\app\src\main\res\values\themes.xml ===
+<?xml version="1.0" encoding="utf-8"?>
+<resources xmlns:tools="http://schemas.android.com/tools">
+    <style name="Theme.AbuJhan" parent="Theme.Material3.DayNight.NoActionBar">
+        <item name="colorPrimary">@color/primary</item>
+        <item name="colorPrimaryDark">@color/primary_dark</item>
+        <item name="colorSecondary">@color/accent</item>
+        <item name="android:statusBarColor" tools:targetApi="l">@color/primary_dark</item>
+    </style>
+</resources>
+
+=== C:\Users\Msi\Desktop\flint\abujhan-container\app\src\main\res\xml\file_paths.xml ===
+<?xml version="1.0" encoding="utf-8"?>
+<paths xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- Clones are written here before being handed to the system installer. -->
+    <files-path name="clones" path="clones/" />
+    <cache-path name="clone_cache" path="clones/" />
+</paths>
+
+=== C:\Users\Msi\Desktop\flint\abujhan-container\app\src\main\AndroidManifest.xml ===
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <!-- Needed to list every installed (launchable) app. -->
+    <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES"
+        tools:ignore="QueryAllPackagesPermission" />
+
+    <!-- Install the built clone through the system installer. -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+    <uses-permission android:name="android.permission.REQUEST_DELETE_PACKAGES" />
+
+    <!-- ABUJHAN is the system-wide mock location provider (selectable in Developer options). -->
+    <uses-permission android:name="android.permission.ACCESS_MOCK_LOCATION" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION" />
+
+    <!-- Map tiles for picking a location. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <!-- Fake location (host side). -->
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!-- Lets us find apps that have a launcher icon. -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LAUNCHER" />
+        </intent>
+    </queries>
+
+    <application
+        android:name=".App"
+        android:allowBackup="false"
+        android:largeHeap="true"
+        android:icon="@drawable/ic_launcher"
+        android:label="@string/app_name"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.AbuJhan">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:launchMode="singleTop">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- Hands the built clone APK to the system package installer. -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${fileProviderAuthority}"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
+
+        <activity
+            android:name=".ui.MapPickerActivity"
+            android:exported="false" />
+
+        <!-- يقرأه الاعتراض داخل النسخ (الموقع الحالي فقط). -->
+        <provider
+            android:name=".location.LocationProvider"
+            android:authorities="com.abujhan.container.location"
+            android:exported="true" />
+
+        <service
+            android:name=".location.MockLocationService"
+            android:exported="false"
+            android:foregroundServiceType="location" />
+
+        <!-- Receives the result of a multi-APK (split) install session. -->
+        <receiver
+            android:name=".clone.CloneInstallReceiver"
+            android:exported="false" />
+    </application>
+
+</manifest>
+
+=== C:\Users\Msi\Desktop\flint\abujhan-container\app\build.gradle.kts ===
+plugins {
+    id("com.android.application")
+    id("org.jetbrains.kotlin.android")
+}
+
+android {
+    namespace = "com.abujhan.container"
+    compileSdk = 35
+
+    defaultConfig {
+        applicationId = "com.abujhan.container"
+        minSdk = 26
+        targetSdk = 35
+        versionCode = 1
+        versionName = "1.0"
+
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+
+        // Authority used by FileProvider to hand the built clone APK to the system installer.
+        manifestPlaceholders["fileProviderAuthority"] = "com.abujhan.container.fileprovider"
+    }
+
+    buildTypes {
+        release {
+            isMinifyEnabled = false
+            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+
+    kotlinOptions {
+        jvmTarget = "17"
+    }
+
+    buildFeatures {
+        viewBinding = true
+    }
+
+    packaging {
+        resources.excludes += setOf("META-INF/*.kotlin_module")
+    }
+}
+
+// اجعل مخرجات الاختبارات (println) تظهر في الطرفية
+tasks.withType<Test>().configureEach {
+    testLogging { showStandardStreams = true }
+}
+
+dependencies {
+    implementation("androidx.core:core-ktx:1.13.1")
+    implementation("androidx.appcompat:appcompat:1.7.0")
+    implementation("com.google.android.material:material:1.12.0")
+    implementation("androidx.constraintlayout:constraintlayout:2.1.4")
+    implementation("androidx.recyclerview:recyclerview:1.3.2")
+    implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.6")
+    implementation("androidx.lifecycle:lifecycle-viewmodel-ktx:2.8.6")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
+    implementation("org.osmdroid:osmdroid-android:6.1.20")
+    implementation("androidx.swiperefreshlayout:swiperefreshlayout:1.1.0")
+
+    // إعادة كتابة ملفات dex داخل التطبيق (لاعتراض استدعاءات الموقع في النسخ).
+    implementation("org.smali:dexlib2:2.5.2")
+
+    // APK signing (same library Android Studio / apksigner uses).
+    implementation("com.android.tools.build:apksig:8.10.1")
+
+    testImplementation("junit:junit:4.13.2")
+
+    androidTestImplementation("androidx.test.ext:junit:1.2.1")
+    androidTestImplementation("androidx.test:runner:1.6.2")
+    androidTestImplementation("androidx.test:core:1.6.1")
+}
+
+=== C:\Users\Msi\Desktop\flint\abujhan-container\gradle\wrapper\gradle-wrapper.properties ===
+distributionBase=GRADLE_USER_HOME
+distributionPath=wrapper/dists
+distributionUrl=https\://services.gradle.org/distributions/gradle-9.6.0-bin.zip
+networkTimeout=10000
+validateDistributionUrl=true
+zipStoreBase=GRADLE_USER_HOME
+zipStorePath=wrapper/dists
+=== C:\Users\Msi\Desktop\flint\abujhan-container\inject\src\main\java\com\container\inject\InjectConfig.java ===
+package com.container.inject;
+
+import android.content.Context;
+
+import org.json.JSONObject;
+
+import java.io.ByteArrayOutputStream;
+import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
+
+/** يقرأ ملف الإعدادات الذي تضيفه الحاوية المضيفة إلى النسخة. */
+final class InjectConfig {
+
+    static final String ASSET = "abujhan_inject.json";
+
+    static JSONObject load(Context context) {
+        try (InputStream in = context.getAssets().open(ASSET)) {
+            return new JSONObject(new String(readAll(in), StandardCharsets.UTF_8));
+        } catch (Throwable t) {
+            return new JSONObject();
+        }
+    }
+
+    private static byte[] readAll(InputStream in) throws Exception {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        byte[] buffer = new byte[4096];
+        int n;
+        while ((n = in.read(buffer)) > 0) {
+            out.write(buffer, 0, n);
+        }
+        return out.toByteArray();
+    }
+
+    private InjectConfig() {
+    }
+}
+
+=== C:\Users\Msi\Desktop\flint\abujhan-container\inject\src\main\java\com\container\inject\InjectProvider.java ===
+package com.container.inject;
+
+import android.content.ContentProvider;
+import android.content.ContentValues;
+import android.database.Cursor;
+import android.net.Uri;
+import android.util.Log;
+
+/**
+ * مزوّد محتوى يُضاف إلى مانيفست النسخة (عبر محرّر AXML).
+ * يُنشئه النظام عند إقلاع النسخة، فيقوم بتسجيل المستقبِل وتشغيل الموقع الوهمي
+ * قبل ظهور أي واجهة.
+ */
+public final class InjectProvider extends ContentProvider {
+
+    public static final String TAG = "ContainerLocInject";
+
+    @Override
+    public boolean onCreate() {
+        try {
+            Log.i(TAG, "InjectProvider.onCreate pkg=" + getContext().getPackageName());
+        } catch (Throwable ignored) {
+        }
+        try {
+            LocationHook.init(getContext());
+        } catch (Throwable ignored) {
+        }
+        return true;
+    }
+
+    @Override
+    public Cursor query(Uri uri, String[] projection, String selection,
+                        String[] selectionArgs, String sortOrder) {
+        return null;
+    }
+
+    @Override
+    public String getType(Uri uri) {
+        return null;
+    }
+
+    @Override
+    public Uri insert(Uri uri, ContentValues values) {
+        return null;
+    }
+
+    @Override
+    public int delete(Uri uri, String selection, String[] selectionArgs) {
+        return 0;
+    }
+
+    @Override
+    public int update(Uri uri, ContentValues values, String selection, String[] selectionArgs) {
+        return 0;
+    }
+}
+
+=== C:\Users\Msi\Desktop\flint\abujhan-container\inject\src\main\java\com\container\inject\LocationHook.java ===
+package com.container.inject;
+
+import android.content.Context;
+import android.database.Cursor;
+import android.location.Location;
+import android.location.LocationListener;
+import android.location.LocationManager;
+import android.net.Uri;
+import android.os.Handler;
+import android.os.Looper;
+import android.os.SystemClock;
+
+import com.google.android.gms.location.FusedLocationProviderClient;
+import com.google.android.gms.location.LocationCallback;
+import com.google.android.gms.location.LocationRequest;
+import com.google.android.gms.location.LocationResult;
+import com.google.android.gms.tasks.Task;
+import com.google.android.gms.tasks.Tasks;
+
+import java.util.Collections;
+import java.util.IdentityHashMap;
+import java.util.Map;
+
+/**
+ * نقاط الاعتراض التي يستدعيها كود التطبيق المستنسخ بدل واجهات الموقع الأصلية.
+ *
+ * كل دالة تقدّم موقعًا وهميًا إن كان التزييف مفعّلًا في ABUJHAN، وإلا تستدعي الواجهة
+ * الأصلية. الموقع يُقرأ من مزوّد المحتوى الذي تنشره ABUJHAN، فلا تحتاج النسخة إلى root
+ * ولا إلى خيارات المطوّر.
+ */
+public final class LocationHook {
+
+    private static final Uri CURRENT = Uri.parse("content://com.abujhan.container.location/current");
+    private static final long CACHE_MS = 500L;
+    private static final long TICK_MS = 1000L;
+
+    private static final Handler HANDLER = new Handler(Looper.getMainLooper());
+    private static final Map<Object, Runnable> FUSED_TICKS = new IdentityHashMap<>();
+    private static final Map<Object, Runnable> MANAGER_TICKS = new IdentityHashMap<>();
+
+    private static Context sContext;
+    private static long sCachedAt;
+    private static double sLat;
+    private static double sLng;
+    private static float sAcc;
+    private static boolean sActive;
+
+    private LocationHook() {
+    }
+
+    /** يُستدعى من InjectProvider عند بدء النسخة. */
+    public static void init(Context context) {
+        sContext = context.getApplicationContext();
+    }
+
+    // ---------------------------------------------------------- LocationManager
+
+    /** بديل LocationManager.getLastKnownLocation(String). */
+    public static Location getLastKnownLocation(LocationManager manager, String provider) {
+        Location fake = fakeLocation(provider);
+        if (fake != null) {
+            return fake;
+        }
+        return manager.getLastKnownLocation(provider);
+    }
+
+    /** بديل LocationManager.requestLocationUpdates(String, long, float, LocationListener). */
+    public static void requestLocationUpdates(LocationManager manager, String provider,
+                                              long minTime, float minDistance, LocationListener listener) {
+        if (!refresh()) {
+            manager.requestLocationUpdates(provider, minTime, minDistance, listener);
+            return;
+        }
+        Runnable tick = new Runnable() {
+            @Override
+            public void run() {
+                Location fake = fakeLocation(provider);
+                if (fake == null) {
+                    return;
+                }
+                listener.onLocationChanged(fake);
+                HANDLER.postDelayed(this, TICK_MS);
+            }
+        };
+        synchronized (MANAGER_TICKS) {
+            Runnable previous = MANAGER_TICKS.put(listener, tick);
+            if (previous != null) {
+                HANDLER.removeCallbacks(previous);
+            }
+        }
+        HANDLER.post(tick);
+    }
+
+    /** بديل LocationManager.requestLocationUpdates(String, long, float, LocationListener, Looper). */
+    public static void requestLocationUpdates(LocationManager manager, String provider, long minTime,
+                                              float minDistance, LocationListener listener, Looper looper) {
+        requestLocationUpdates(manager, provider, minTime, minDistance, listener);
+    }
+
+    /** بديل LocationManager.requestLocationUpdates(String, android.location.LocationRequest, Executor, LocationListener). */
+    public static void requestLocationUpdates(LocationManager manager, String provider,
+                                              android.location.LocationRequest request,
+                                              java.util.concurrent.Executor executor, LocationListener listener) {
+        long interval = request == null ? 1000L : Math.max(1000L, request.getIntervalMillis());
+        requestLocationUpdates(manager, provider, interval, 0f, listener);
+    }
+
+    /** بديل LocationManager.removeUpdates(LocationListener). */
+    public static void removeUpdates(LocationManager manager, LocationListener listener) {
+        Runnable tick;
+        synchronized (MANAGER_TICKS) {
+            tick = MANAGER_TICKS.remove(listener);
+        }
+        if (tick != null) {
+            HANDLER.removeCallbacks(tick);
+            return;
+        }
+        manager.removeUpdates(listener);
+    }
+
+    // ------------------------------------------------------------ Fused (GMS)
+
+    /** بديل FusedLocationProviderClient.getLastLocation(). */
+    public static Task<Location> getLastLocation(FusedLocationProviderClient client) {
+        Location fake = fakeLocation("fused");
+        if (fake != null) {
+            return Tasks.forResult(fake);
+        }
+        return client.getLastLocation();
+    }
+
+    /** بديل FusedLocationProviderClient.requestLocationUpdates(LocationRequest, LocationCallback, Looper). */
+    public static Task<Void> requestLocationUpdates(FusedLocationProviderClient client, LocationRequest request,
+                                                    LocationCallback callback, Looper looper) {
+        if (!refresh()) {
+            return client.requestLocationUpdates(request, callback, looper);
+        }
+        Runnable tick = new Runnable() {
+            @Override
+            public void run() {
+                Location fake = fakeLocation("fused");
+                if (fake == null) {
+                    return;
+                }
+                callback.onLocationResult(LocationResult.create(Collections.singletonList(fake)));
+                HANDLER.postDelayed(this, TICK_MS);
+            }
+        };
+        synchronized (FUSED_TICKS) {
+            Runnable previous = FUSED_TICKS.put(callback, tick);
+            if (previous != null) {
+                HANDLER.removeCallbacks(previous);
+            }
+        }
+        HANDLER.post(tick);
+        return Tasks.forResult(null);
+    }
+
+    /** بديل FusedLocationProviderClient.removeLocationUpdates(LocationCallback). */
+    public static Task<Void> removeLocationUpdates(FusedLocationProviderClient client, LocationCallback callback) {
+        Runnable tick;
+        synchronized (FUSED_TICKS) {
+            tick = FUSED_TICKS.remove(callback);
+        }
+        if (tick != null) {
+            HANDLER.removeCallbacks(tick);
+            return Tasks.forResult(null);
+        }
+        return client.removeLocationUpdates(callback);
+    }
+
+    /**
+     * بديل PlayServicesLocationManager.requestLocationUpdates(LocationRequest, LocationCallback)
+     * الخاص بمكتبة React Native للموقع. عند الإيقاف تُستدعى الدالة الأصلية عبر الانعكاس.
+     */
+    public static void requestPlayServicesUpdates(Object owner, LocationRequest request, LocationCallback callback) {
+        if (!refresh()) {
+            try {
+                java.lang.reflect.Method original = owner.getClass().getDeclaredMethod(
+                        "requestLocationUpdates", LocationRequest.class, LocationCallback.class);
+                original.setAccessible(true);
+                original.invoke(owner, request, callback);
+            } catch (Throwable ignored) {
+            }
+            return;
+        }
+        Runnable tick = new Runnable() {
+            @Override
+            public void run() {
+                Location fake = fakeLocation("fused");
+                if (fake == null) {
+                    return;
+                }
+                callback.onLocationResult(LocationResult.create(Collections.singletonList(fake)));
+                HANDLER.postDelayed(this, TICK_MS);
+            }
+        };
+        synchronized (FUSED_TICKS) {
+            Runnable previous = FUSED_TICKS.put(callback, tick);
+            if (previous != null) {
+                HANDLER.removeCallbacks(previous);
+            }
+        }
+        HANDLER.post(tick);
+    }
+
+    // ----------------------------------------------------------------- helpers
+
+    private static synchronized Location fakeLocation(String provider) {
+        if (!refresh()) {
+            return null;
+        }
+        Location location = new Location(provider == null ? "fused" : provider);
+        location.setLatitude(sLat);
+        location.setLongitude(sLng);
+        location.setAccuracy(sAcc);
+        location.setTime(System.currentTimeMillis());
+        location.setElapsedRealtimeNanos(SystemClock.elapsedRealtimeNanos());
+        return location;
+    }
+
+    /** يحدّث الموقع من ABUJHAN بعد مهلة قصيرة. يعيد false إن لم يكن مفعّلًا. */
+    private static synchronized boolean refresh() {
+        long now = SystemClock.elapsedRealtime();
+        if (now - sCachedAt < CACHE_MS) {
+            return sActive;
+        }
+        sCachedAt = now;
+        sActive = false;
+        if (sContext == null) {
+            return false;
+        }
+        try (Cursor cursor = sContext.getContentResolver().query(CURRENT, null, null, null, null)) {
+            if (cursor != null && cursor.moveToFirst()) {
+                sActive = cursor.getInt(cursor.getColumnIndexOrThrow("active")) == 1;
+                sLat = cursor.getDouble(cursor.getColumnIndexOrThrow("lat"));
+                sLng = cursor.getDouble(cursor.getColumnIndexOrThrow("lng"));
+                sAcc = cursor.getFloat(cursor.getColumnIndexOrThrow("acc"));
+            }
+        } catch (Throwable ignored) {
+            sActive = false;
+        }
+        return sActive;
+    }
+}
+
+=== C:\Users\Msi\Desktop\flint\abujhan-container\inject\build.gradle.kts ===
+plugins {
+    id("com.android.library")
+    id("org.jetbrains.kotlin.android")
+}
+
+android {
+    namespace = "com.container.inject"
+    compileSdk = 35
+
+    defaultConfig {
+        minSdk = 26
+    }
+
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+
+    kotlinOptions {
+        jvmTarget = "17"
+    }
+}
+
+dependencies {
+    // للترجمة فقط: الأصناف موجودة في التطبيق المستنسخ نفسه وقت التشغيل.
+    compileOnly("com.google.android.gms:play-services-location:21.3.0")
+    compileOnly("com.google.android.gms:play-services-tasks:18.2.0")
+}
+
+// ---------------------------------------------------------------------------
+// هذا الموديول لا يُثبَّت على حدة. أصنافه هي التي تُحقَن داخل كل نسخة:
+//   - InjectProvider        : مزوّد محتوى يبدأ عند إقلاع النسخة.
+//   - ApplyLocationReceiver : يستقبل الإحداثيات من الحاوية المضيفة.
+//   - LocationSpoofer       : يشغّل مزوّد الموقع الوهمي.
+//
+// لتوليد ملف app/src/main/assets/location_inject.dex من هذه الأصناف شغّل:
+//     tools\build_inject_dex.bat
+// (السكربت يستخدم javac ثم d8 من أدوات بناء أندرويد.)
+// ---------------------------------------------------------------------------
+
+=== C:\Users\Msi\Desktop\flint\abujhan-container\build.gradle.kts ===
+// Root build file. Plugins are declared here (with `apply false`) so every module
+// can use the same versions.
+plugins {
+    id("com.android.application") version "8.10.1" apply false
+    id("com.android.library") version "8.10.1" apply false
+    id("org.jetbrains.kotlin.android") version "2.2.10" apply false
+}
+
+=== C:\Users\Msi\Desktop\flint\abujhan-container\gradle.properties ===
+# --- Gradle / JVM ---
+org.gradle.jvmargs=-Xmx3072m -Dfile.encoding=UTF-8
+org.gradle.parallel=true
+org.gradle.caching=true
+
+# --- Android ---
+android.useAndroidX=true
+android.nonTransitiveRClass=true
+
+# --- Kotlin ---
+kotlin.code.style=official
+
+# Enabled parallel sync for Gradle 9.4+
+org.gradle.tooling.parallel=true
+
+=== C:\Users\Msi\Desktop\flint\abujhan-container\local.properties ===
+## هذا الملف خاص بجهازك ولا يُرفع إلى أي نظام إدارة إصدارات.
+sdk.dir=C\:\\Users\\Msi\\AppData\\Local\\Android\\Sdk
+
+=== C:\Users\Msi\Desktop\flint\abujhan-container\settings.gradle.kts ===
+pluginManagement {
+    repositories {
+        google()
+        mavenCentral()
+        gradlePluginPortal()
+    }
+}
+
+dependencyResolutionManagement {
+    repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+    repositories {
+        google()
+        mavenCentral()
+    }
+}
+
+rootProject.name = "AbuJhanContainer"
+include(":app")
+include(":inject")
+

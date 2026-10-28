@@ -1,0 +1,22 @@
+[
+    {
+        "merged": "C:\\Users\\Msi\\.gradle\\daemon\\9.6.0\\com.abujhan.container.app-mergeDebugResources-36:\\layout\\activity_map_picker.xml",
+        "source": "C:\\Users\\Msi\\.gradle\\daemon\\9.6.0\\com.abujhan.container.app-main-39:\\layout\\activity_map_picker.xml"
+    },
+    {
+        "merged": "C:\\Users\\Msi\\.gradle\\daemon\\9.6.0\\com.abujhan.container.app-mergeDebugResources-36:\\layout\\item_app.xml",
+        "source": "C:\\Users\\Msi\\.gradle\\daemon\\9.6.0\\com.abujhan.container.app-main-39:\\layout\\item_app.xml"
+    },
+    {
+        "merged": "C:\\Users\\Msi\\.gradle\\daemon\\9.6.0\\com.abujhan.container.app-mergeDebugResources-36:\\layout\\item_container.xml",
+        "source": "C:\\Users\\Msi\\.gradle\\daemon\\9.6.0\\com.abujhan.container.app-main-39:\\layout\\item_container.xml"
+    },
+    {
+        "merged": "C:\\Users\\Msi\\.gradle\\daemon\\9.6.0\\com.abujhan.container.app-mergeDebugResources-36:\\layout\\activity_main.xml",
+        "source": "C:\\Users\\Msi\\.gradle\\daemon\\9.6.0\\com.abujhan.container.app-main-39:\\layout\\activity_main.xml"
+    },
+    {
+        "merged": "com.abujhan.container.app-mergeDebugResources-36:/layout/dialog_progress.xml",
+        "source": "com.abujhan.container.app-main-39:/layout/dialog_progress.xml"
+    }
+]
